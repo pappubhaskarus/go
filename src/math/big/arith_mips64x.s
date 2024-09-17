@@ -3,16 +3,11 @@
 // license that can be found in the LICENSE file.
 
 //go:build !math_big_pure_go && (mips64 || mips64le)
-// +build !math_big_pure_go
-// +build mips64 mips64le
 
 #include "textflag.h"
 
 // This file provides fast assembly versions for the elementary
 // arithmetic operations on vectors implemented in arith.go.
-
-TEXT ·mulWW(SB),NOSPLIT,$0
-	JMP ·mulWW_g(SB)
 
 TEXT ·addVV(SB),NOSPLIT,$0
 	JMP ·addVV_g(SB)

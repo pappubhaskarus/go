@@ -43,6 +43,8 @@ TEXT ·libc_futimes_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_futimes(SB)
 TEXT ·libc_fcntl_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_fcntl(SB)
+TEXT ·libc_ioctl_trampoline(SB),NOSPLIT,$0-0
+	JMP	libc_ioctl(SB)
 TEXT ·libc_pipe2_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_pipe2(SB)
 TEXT ·libc_accept4_trampoline(SB),NOSPLIT,$0-0
@@ -69,6 +71,8 @@ TEXT ·libc_dup_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_dup(SB)
 TEXT ·libc_dup2_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_dup2(SB)
+TEXT ·libc_dup3_trampoline(SB),NOSPLIT,$0-0
+	JMP	libc_dup3(SB)
 TEXT ·libc_fchdir_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_fchdir(SB)
 TEXT ·libc_fchflags_trampoline(SB),NOSPLIT,$0-0
@@ -199,14 +203,16 @@ TEXT ·libc_unmount_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_unmount(SB)
 TEXT ·libc_write_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_write(SB)
+TEXT ·libc_writev_trampoline(SB),NOSPLIT,$0-0
+	JMP	libc_writev(SB)
 TEXT ·libc_mmap_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_mmap(SB)
 TEXT ·libc_munmap_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_munmap(SB)
+TEXT ·libc_getfsstat_trampoline(SB),NOSPLIT,$0-0
+	JMP	libc_getfsstat(SB)
 TEXT ·libc_utimensat_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_utimensat(SB)
-TEXT ·libc_syscall_trampoline(SB),NOSPLIT,$0-0
-	JMP	libc_syscall(SB)
 TEXT ·libc_lseek_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_lseek(SB)
 TEXT ·libc_getcwd_trampoline(SB),NOSPLIT,$0-0
@@ -215,8 +221,6 @@ TEXT ·libc_sysctl_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_sysctl(SB)
 TEXT ·libc_fork_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_fork(SB)
-TEXT ·libc_ioctl_trampoline(SB),NOSPLIT,$0-0
-	JMP	libc_ioctl(SB)
 TEXT ·libc_execve_trampoline(SB),NOSPLIT,$0-0
 	JMP	libc_execve(SB)
 TEXT ·libc_exit_trampoline(SB),NOSPLIT,$0-0

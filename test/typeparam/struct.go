@@ -1,4 +1,4 @@
-// run -gcflags=-G=3
+// run
 
 // Copyright 2021 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
@@ -21,6 +21,7 @@ type S1 struct {
 
 type Eint = E[int]
 type Ebool = E[bool]
+type Eint2 = Eint
 
 type S2 struct {
 	Eint

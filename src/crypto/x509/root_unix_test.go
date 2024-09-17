@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -149,7 +149,7 @@ func TestLoadSystemCertsLoadColonSeparatedDirs(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	rootPEMs := []string{
-		geoTrustRoot,
+		gtsRoot,
 		googleLeaf,
 		startComRoot,
 	}
@@ -222,7 +222,7 @@ func TestReadUniqueDirectoryEntries(t *testing.T) {
 		gotNames = append(gotNames, fi.Name())
 	}
 	wantNames := []string{"file", "link-out"}
-	if !reflect.DeepEqual(gotNames, wantNames) {
+	if !slices.Equal(gotNames, wantNames) {
 		t.Errorf("got %q; want %q", gotNames, wantNames)
 	}
 }

@@ -5,9 +5,11 @@
 package types2
 
 import (
+	"cmp"
 	"container/heap"
 	"fmt"
-	"sort"
+	. "internal/types/errors"
+	"slices"
 )
 
 // initOrder computes the Info.InitOrder for package variables.
@@ -152,20 +154,23 @@ func findPath(objMap map[Object]*declInfo, from, to Object, seen map[Object]bool
 // reportCycle reports an error for the given cycle.
 func (check *Checker) reportCycle(cycle []Object) {
 	obj := cycle[0]
-	var err error_
-	if check.conf.CompilerErrorMessages {
-		err.errorf(obj, "initialization loop for %s", obj.Name())
-	} else {
-		err.errorf(obj, "initialization cycle for %s", obj.Name())
+
+	// report a more concise error for self references
+	if len(cycle) == 1 {
+		check.errorf(obj, InvalidInitCycle, "initialization cycle: %s refers to itself", obj.Name())
+		return
 	}
+
+	err := check.newError(InvalidInitCycle)
+	err.addf(obj, "initialization cycle for %s", obj.Name())
 	// subtle loop: print cycle[i] for i = 0, n-1, n-2, ... 1 for len(cycle) = n
 	for i := len(cycle) - 1; i >= 0; i-- {
-		err.errorf(obj, "%s refers to", obj.Name())
+		err.addf(obj, "%s refers to", obj.Name())
 		obj = cycle[i]
 	}
 	// print cycle[0] again to close the cycle
-	err.errorf(obj, "%s", obj.Name())
-	check.report(&err)
+	err.addf(obj, "%s", obj.Name())
+	err.report()
 }
 
 // ----------------------------------------------------------------------------
@@ -253,8 +258,8 @@ func dependencyGraph(objMap map[Object]*declInfo) []*graphNode {
 	// throughout the function graph, the cost of removing a function at
 	// position X is proportional to cost * (len(funcG)-X). Therefore, we should
 	// remove high-cost functions last.
-	sort.Slice(funcG, func(i, j int) bool {
-		return funcG[i].cost() < funcG[j].cost()
+	slices.SortFunc(funcG, func(a, b *graphNode) int {
+		return cmp.Compare(a.cost(), b.cost())
 	})
 	for _, n := range funcG {
 		// connect each predecessor p of n with each successor s
@@ -305,16 +310,24 @@ func (a nodeQueue) Swap(i, j int) {
 
 func (a nodeQueue) Less(i, j int) bool {
 	x, y := a[i], a[j]
+
+	// Prioritize all constants before non-constants. See go.dev/issue/66575/.
+	_, xConst := x.obj.(*Const)
+	_, yConst := y.obj.(*Const)
+	if xConst != yConst {
+		return xConst
+	}
+
 	// nodes are prioritized by number of incoming dependencies (1st key)
 	// and source order (2nd key)
 	return x.ndeps < y.ndeps || x.ndeps == y.ndeps && x.obj.order() < y.obj.order()
 }
 
-func (a *nodeQueue) Push(x interface{}) {
+func (a *nodeQueue) Push(x any) {
 	panic("unreachable")
 }
 
-func (a *nodeQueue) Pop() interface{} {
+func (a *nodeQueue) Pop() any {
 	n := len(*a)
 	x := (*a)[n-1]
 	x.index = -1 // for safety

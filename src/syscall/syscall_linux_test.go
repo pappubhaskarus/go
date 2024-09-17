@@ -5,42 +5,23 @@
 package syscall_test
 
 import (
+	"context"
 	"fmt"
+	"internal/testenv"
 	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"unsafe"
 )
-
-// chtmpdir changes the working directory to a new temporary directory and
-// provides a cleanup function. Used when PWD is read-only.
-func chtmpdir(t *testing.T) func() {
-	oldwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("chtmpdir: %v", err)
-	}
-	d, err := os.MkdirTemp("", "test")
-	if err != nil {
-		t.Fatalf("chtmpdir: %v", err)
-	}
-	if err := os.Chdir(d); err != nil {
-		t.Fatalf("chtmpdir: %v", err)
-	}
-	return func() {
-		if err := os.Chdir(oldwd); err != nil {
-			t.Fatalf("chtmpdir: %v", err)
-		}
-		os.RemoveAll(d)
-	}
-}
 
 func touch(t *testing.T, name string) {
 	f, err := os.Create(name)
@@ -61,7 +42,7 @@ const (
 )
 
 func TestFaccessat(t *testing.T) {
-	defer chtmpdir(t)()
+	t.Chdir(t.TempDir())
 	touch(t, "file1")
 
 	err := syscall.Faccessat(_AT_FDCWD, "file1", _R_OK, 0)
@@ -113,7 +94,7 @@ func TestFaccessat(t *testing.T) {
 }
 
 func TestFchmodat(t *testing.T) {
-	defer chtmpdir(t)()
+	t.Chdir(t.TempDir())
 
 	touch(t, "file1")
 	os.Symlink("file1", "symlink1")
@@ -197,18 +178,21 @@ func TestSyscallNoError(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("skipping root only test")
 	}
+	if testing.Short() && testenv.Builder() != "" && os.Getenv("USER") == "swarming" {
+		// The Go build system's swarming user is known not to be root.
+		// Unfortunately, it sometimes appears as root due the current
+		// implementation of a no-network check using 'unshare -n -r'.
+		// Since this test does need root to work, we need to skip it.
+		t.Skip("skipping root only test on a non-root builder")
+	}
 
 	if runtime.GOOS == "android" {
 		t.Skip("skipping on rooted android, see issue 27364")
 	}
 
 	// Copy the test binary to a location that a non-root user can read/execute
-	// after we drop privileges
-	tempDir, err := os.MkdirTemp("", "TestSyscallNoError")
-	if err != nil {
-		t.Fatalf("cannot create temporary directory: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	// after we drop privileges.
+	tempDir := t.TempDir()
 	os.Chmod(tempDir, 0755)
 
 	tmpBinary := filepath.Join(tempDir, filepath.Base(os.Args[0]))
@@ -475,7 +459,7 @@ func compareStatus(filter, expect string) error {
 					// https://github.com/golang/go/issues/46145
 					// Containers don't reliably output this line in sorted order so manually sort and compare that.
 					a := strings.Split(line[8:], " ")
-					sort.Strings(a)
+					slices.Sort(a)
 					got := strings.Join(a, " ")
 					if got == expected[8:] {
 						foundAThread = true
@@ -514,6 +498,16 @@ func killAThread(c <-chan struct{}) {
 func TestSetuidEtc(t *testing.T) {
 	if syscall.Getuid() != 0 {
 		t.Skip("skipping root only test")
+	}
+	if testing.Short() && testenv.Builder() != "" && os.Getenv("USER") == "swarming" {
+		// The Go build system's swarming user is known not to be root.
+		// Unfortunately, it sometimes appears as root due the current
+		// implementation of a no-network check using 'unshare -n -r'.
+		// Since this test does need root to work, we need to skip it.
+		t.Skip("skipping root only test on a non-root builder")
+	}
+	if _, err := os.Stat("/etc/alpine-release"); err == nil {
+		t.Skip("skipping glibc test on alpine - go.dev/issue/19938")
 	}
 	vs := []struct {
 		call           string
@@ -564,4 +558,334 @@ func TestSetuidEtc(t *testing.T) {
 			t.Errorf("[%d] %q comparison: %v", i, v.call, err)
 		}
 	}
+}
+
+// TestAllThreadsSyscallError verifies that errors are properly returned when
+// the syscall fails on the original thread.
+func TestAllThreadsSyscallError(t *testing.T) {
+	// SYS_CAPGET takes pointers as the first two arguments. Since we pass
+	// 0, we expect to get EFAULT back.
+	r1, r2, err := syscall.AllThreadsSyscall(syscall.SYS_CAPGET, 0, 0, 0)
+	if err == syscall.ENOTSUP {
+		t.Skip("AllThreadsSyscall disabled with cgo")
+	}
+	if err != syscall.EFAULT {
+		t.Errorf("AllThreadSyscall(SYS_CAPGET) got %d, %d, %v, want err %v", r1, r2, err, syscall.EFAULT)
+	}
+}
+
+// TestAllThreadsSyscallBlockedSyscall confirms that AllThreadsSyscall
+// can interrupt threads in long-running system calls. This test will
+// deadlock if this doesn't work correctly.
+func TestAllThreadsSyscallBlockedSyscall(t *testing.T) {
+	if _, _, err := syscall.AllThreadsSyscall(syscall.SYS_PRCTL, PR_SET_KEEPCAPS, 0, 0); err == syscall.ENOTSUP {
+		t.Skip("AllThreadsSyscall disabled with cgo")
+	}
+
+	rd, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("unable to obtain a pipe: %v", err)
+	}
+
+	// Perform a blocking read on the pipe.
+	var wg sync.WaitGroup
+	ready := make(chan bool)
+	wg.Add(1)
+	go func() {
+		data := make([]byte, 1)
+
+		// To narrow the window we have to wait for this
+		// goroutine to block in read, synchronize just before
+		// calling read.
+		ready <- true
+
+		// We use syscall.Read directly to avoid the poller.
+		// This will return when the write side is closed.
+		n, err := syscall.Read(int(rd.Fd()), data)
+		if !(n == 0 && err == nil) {
+			t.Errorf("expected read to return 0, got %d, %s", n, err)
+		}
+
+		// Clean up rd and also ensure rd stays reachable so
+		// it doesn't get closed by GC.
+		rd.Close()
+		wg.Done()
+	}()
+	<-ready
+
+	// Loop here to give the goroutine more time to block in read.
+	// Generally this will trigger on the first iteration anyway.
+	pid := syscall.Getpid()
+	for i := 0; i < 100; i++ {
+		if id, _, e := syscall.AllThreadsSyscall(syscall.SYS_GETPID, 0, 0, 0); e != 0 {
+			t.Errorf("[%d] getpid failed: %v", i, e)
+		} else if int(id) != pid {
+			t.Errorf("[%d] getpid got=%d, want=%d", i, id, pid)
+		}
+		// Provide an explicit opportunity for this goroutine
+		// to change Ms.
+		runtime.Gosched()
+	}
+	wr.Close()
+	wg.Wait()
+}
+
+func TestPrlimitSelf(t *testing.T) {
+	origLimit := syscall.OrigRlimitNofile()
+	origRlimitNofile := syscall.GetInternalOrigRlimitNofile()
+
+	if origLimit == nil {
+		defer origRlimitNofile.Store(origLimit)
+		origRlimitNofile.Store(&syscall.Rlimit{
+			Cur: 1024,
+			Max: 65536,
+		})
+	}
+
+	// Get current process's nofile limit
+	var lim syscall.Rlimit
+	if err := syscall.Prlimit(0, syscall.RLIMIT_NOFILE, nil, &lim); err != nil {
+		t.Fatalf("Failed to get the current nofile limit: %v", err)
+	}
+	// Set current process's nofile limit through prlimit
+	if err := syscall.Prlimit(0, syscall.RLIMIT_NOFILE, &lim, nil); err != nil {
+		t.Fatalf("Prlimit self failed: %v", err)
+	}
+
+	rlimLater := origRlimitNofile.Load()
+	if rlimLater != nil {
+		t.Fatalf("origRlimitNofile got=%v, want=nil", rlimLater)
+	}
+}
+
+func TestPrlimitOtherProcess(t *testing.T) {
+	origLimit := syscall.OrigRlimitNofile()
+	origRlimitNofile := syscall.GetInternalOrigRlimitNofile()
+
+	if origLimit == nil {
+		defer origRlimitNofile.Store(origLimit)
+		origRlimitNofile.Store(&syscall.Rlimit{
+			Cur: 1024,
+			Max: 65536,
+		})
+	}
+	rlimOrig := origRlimitNofile.Load()
+
+	// Start a child process firstly,
+	// so we can use Prlimit to set it's nofile limit.
+	cmd := exec.Command("sleep", "infinity")
+	cmd.Start()
+	defer func() {
+		cmd.Process.Kill()
+		cmd.Process.Wait()
+	}()
+
+	// Get child process's current nofile limit
+	var lim syscall.Rlimit
+	if err := syscall.Prlimit(cmd.Process.Pid, syscall.RLIMIT_NOFILE, nil, &lim); err != nil {
+		t.Fatalf("Failed to get the current nofile limit: %v", err)
+	}
+	// Set child process's nofile rlimit through prlimit
+	if err := syscall.Prlimit(cmd.Process.Pid, syscall.RLIMIT_NOFILE, &lim, nil); err != nil {
+		t.Fatalf("Prlimit(%d) failed: %v", cmd.Process.Pid, err)
+	}
+
+	rlimLater := origRlimitNofile.Load()
+	if rlimLater != rlimOrig {
+		t.Fatalf("origRlimitNofile got=%v, want=%v", rlimLater, rlimOrig)
+	}
+}
+
+const magicRlimitValue = 42
+
+// TestPrlimitFileLimit tests that we can start a Go program, use
+// prlimit to change its NOFILE limit, and have that updated limit be
+// seen by children. See issue #66797.
+func TestPrlimitFileLimit(t *testing.T) {
+	switch os.Getenv("GO_WANT_HELPER_PROCESS") {
+	case "prlimit1":
+		testPrlimitFileLimitHelper1(t)
+		return
+	case "prlimit2":
+		testPrlimitFileLimitHelper2(t)
+		return
+	}
+
+	origRlimitNofile := syscall.GetInternalOrigRlimitNofile()
+	defer origRlimitNofile.Store(origRlimitNofile.Load())
+
+	// Set our rlimit to magic+1/max.
+	// That will also become the rlimit of the child.
+
+	var lim syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
+		t.Fatal(err)
+	}
+	max := lim.Max
+
+	lim = syscall.Rlimit{
+		Cur: magicRlimitValue + 1,
+		Max: max,
+	}
+	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r1, w1, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r1.Close()
+	defer w1.Close()
+
+	r2, w2, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r2.Close()
+	defer w2.Close()
+
+	var output strings.Builder
+
+	const arg = "-test.run=^TestPrlimitFileLimit$"
+	cmd := testenv.CommandContext(t, ctx, exe, arg, "-test.v")
+	cmd = testenv.CleanCmdEnv(cmd)
+	cmd.Env = append(cmd.Env, "GO_WANT_HELPER_PROCESS=prlimit1")
+	cmd.ExtraFiles = []*os.File{r1, w2}
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+
+	t.Logf("running %s %s", exe, arg)
+
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for the child to start.
+	b := make([]byte, 1)
+	if n, err := r2.Read(b); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Fatalf("read %d bytes, want 1", n)
+	}
+
+	// Set the child's prlimit.
+	lim = syscall.Rlimit{
+		Cur: magicRlimitValue,
+		Max: max,
+	}
+	if err := syscall.Prlimit(cmd.Process.Pid, syscall.RLIMIT_NOFILE, &lim, nil); err != nil {
+		t.Fatalf("Prlimit failed: %v", err)
+	}
+
+	// Tell the child to continue.
+	if n, err := w1.Write(b); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Fatalf("wrote %d bytes, want 1", n)
+	}
+
+	err = cmd.Wait()
+	if output.Len() > 0 {
+		t.Logf("%s", output.String())
+	}
+
+	if err != nil {
+		t.Errorf("child failed: %v", err)
+	}
+}
+
+// testPrlimitFileLimitHelper1 is run by TestPrlimitFileLimit.
+func testPrlimitFileLimitHelper1(t *testing.T) {
+	var lim syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("helper1 rlimit is %v", lim)
+	t.Logf("helper1 cached rlimit is %v", syscall.OrigRlimitNofile())
+
+	// Tell the parent that we are ready.
+	b := []byte{0}
+	if n, err := syscall.Write(4, b); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Fatalf("wrote %d bytes, want 1", n)
+	}
+
+	// Wait for the parent to tell us that prlimit was used.
+	if n, err := syscall.Read(3, b); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Fatalf("read %d bytes, want 1", n)
+	}
+
+	if err := syscall.Close(3); err != nil {
+		t.Errorf("Close(3): %v", err)
+	}
+	if err := syscall.Close(4); err != nil {
+		t.Errorf("Close(4): %v", err)
+	}
+
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("after prlimit helper1 rlimit is %v", lim)
+	t.Logf("after prlimit helper1 cached rlimit is %v", syscall.OrigRlimitNofile())
+
+	// Start the grandchild, which should see the rlimit
+	// set by the prlimit called by the parent.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const arg = "-test.run=^TestPrlimitFileLimit$"
+	cmd := testenv.CommandContext(t, ctx, exe, arg, "-test.v")
+	cmd = testenv.CleanCmdEnv(cmd)
+	cmd.Env = append(cmd.Env, "GO_WANT_HELPER_PROCESS=prlimit2")
+	t.Logf("running %s %s", exe, arg)
+	out, err := cmd.CombinedOutput()
+	if len(out) > 0 {
+		t.Logf("%s", out)
+	}
+	if err != nil {
+		t.Errorf("grandchild failed: %v", err)
+	} else {
+		fmt.Println("OK")
+	}
+}
+
+// testPrlimitFileLimitHelper2 is run by testPrlimitFileLimit1.
+func testPrlimitFileLimitHelper2(t *testing.T) {
+	var lim syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("helper2 rlimit is %v", lim)
+	cached := syscall.OrigRlimitNofile()
+	t.Logf("helper2 cached rlimit is %v", cached)
+
+	// The value return by Getrlimit will have been adjusted.
+	// We should have cached the value set by prlimit called by the parent.
+
+	if cached == nil {
+		t.Fatal("no cached rlimit")
+	} else if cached.Cur != magicRlimitValue {
+		t.Fatalf("cached rlimit is %d, want %d", cached.Cur, magicRlimitValue)
+	}
+
+	fmt.Println("OK")
 }

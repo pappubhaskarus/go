@@ -1,5 +1,6 @@
-// +build !js,gc
 // run
+
+//go:build !js && !wasip1 && gc
 
 // Copyright 2017 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
@@ -35,7 +36,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	out, err := exec.Command("go", "tool", "compile", fmt.Sprintf("-trimpath=%s", path), f.Name()).CombinedOutput()
+	out, err := exec.Command("go", "tool", "compile", "-p=p", fmt.Sprintf("-trimpath=%s", path), f.Name()).CombinedOutput()
 	if err == nil {
 		log.Fatalf("expected compiling %s to fail", f.Name())
 	}

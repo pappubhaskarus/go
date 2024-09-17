@@ -5,6 +5,8 @@
 package aes
 
 import (
+	"crypto/internal/cryptotest"
+	"fmt"
 	"testing"
 )
 
@@ -316,36 +318,22 @@ func TestCipherDecrypt(t *testing.T) {
 	}
 }
 
-// Test short input/output.
-// Assembly used to not notice.
-// See issue 7928.
-func TestShortBlocks(t *testing.T) {
-	bytes := func(n int) []byte { return make([]byte, n) }
-
-	c, _ := NewCipher(bytes(16))
-
-	mustPanic(t, "crypto/aes: input not full block", func() { c.Encrypt(bytes(1), bytes(1)) })
-	mustPanic(t, "crypto/aes: input not full block", func() { c.Decrypt(bytes(1), bytes(1)) })
-	mustPanic(t, "crypto/aes: input not full block", func() { c.Encrypt(bytes(100), bytes(1)) })
-	mustPanic(t, "crypto/aes: input not full block", func() { c.Decrypt(bytes(100), bytes(1)) })
-	mustPanic(t, "crypto/aes: output not full block", func() { c.Encrypt(bytes(1), bytes(100)) })
-	mustPanic(t, "crypto/aes: output not full block", func() { c.Decrypt(bytes(1), bytes(100)) })
-}
-
-func mustPanic(t *testing.T, msg string, f func()) {
-	defer func() {
-		err := recover()
-		if err == nil {
-			t.Errorf("function did not panic, wanted %q", msg)
-		} else if err != msg {
-			t.Errorf("got panic %v, wanted %q", err, msg)
-		}
-	}()
-	f()
+// Test AES against the general cipher.Block interface tester
+func TestAESBlock(t *testing.T) {
+	for _, keylen := range []int{128, 192, 256} {
+		t.Run(fmt.Sprintf("AES-%d", keylen), func(t *testing.T) {
+			cryptotest.TestBlock(t, keylen/8, NewCipher)
+		})
+	}
 }
 
 func BenchmarkEncrypt(b *testing.B) {
-	tt := encryptTests[0]
+	b.Run("AES-128", func(b *testing.B) { benchmarkEncrypt(b, encryptTests[1]) })
+	b.Run("AES-192", func(b *testing.B) { benchmarkEncrypt(b, encryptTests[2]) })
+	b.Run("AES-256", func(b *testing.B) { benchmarkEncrypt(b, encryptTests[3]) })
+}
+
+func benchmarkEncrypt(b *testing.B, tt CryptTest) {
 	c, err := NewCipher(tt.key)
 	if err != nil {
 		b.Fatal("NewCipher:", err)
@@ -359,7 +347,12 @@ func BenchmarkEncrypt(b *testing.B) {
 }
 
 func BenchmarkDecrypt(b *testing.B) {
-	tt := encryptTests[0]
+	b.Run("AES-128", func(b *testing.B) { benchmarkDecrypt(b, encryptTests[1]) })
+	b.Run("AES-192", func(b *testing.B) { benchmarkDecrypt(b, encryptTests[2]) })
+	b.Run("AES-256", func(b *testing.B) { benchmarkDecrypt(b, encryptTests[3]) })
+}
+
+func benchmarkDecrypt(b *testing.B, tt CryptTest) {
 	c, err := NewCipher(tt.key)
 	if err != nil {
 		b.Fatal("NewCipher:", err)
@@ -373,11 +366,30 @@ func BenchmarkDecrypt(b *testing.B) {
 }
 
 func BenchmarkExpand(b *testing.B) {
-	tt := encryptTests[0]
-	n := len(tt.key) + 28
-	c := &aesCipher{make([]uint32, n), make([]uint32, n)}
+	b.Run("AES-128", func(b *testing.B) { benchmarkExpand(b, encryptTests[1]) })
+	b.Run("AES-192", func(b *testing.B) { benchmarkExpand(b, encryptTests[2]) })
+	b.Run("AES-256", func(b *testing.B) { benchmarkExpand(b, encryptTests[3]) })
+}
+
+func benchmarkExpand(b *testing.B, tt CryptTest) {
+	c := &aesCipher{l: uint8(len(tt.key) + 28)}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		expandKey(tt.key, c.enc, c.dec)
+		expandKey(tt.key, c.enc[:c.l], c.dec[:c.l])
+	}
+}
+
+func BenchmarkCreateCipher(b *testing.B) {
+	b.Run("AES-128", func(b *testing.B) { benchmarkCreateCipher(b, encryptTests[1]) })
+	b.Run("AES-192", func(b *testing.B) { benchmarkCreateCipher(b, encryptTests[2]) })
+	b.Run("AES-256", func(b *testing.B) { benchmarkCreateCipher(b, encryptTests[3]) })
+}
+
+func benchmarkCreateCipher(b *testing.B, tt CryptTest) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := NewCipher(tt.key); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

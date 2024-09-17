@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !js
-
 package net
 
 import (
@@ -23,7 +21,6 @@ var parseIPTests = []struct {
 	{"::ffff:127.1.2.3", IPv4(127, 1, 2, 3)},
 	{"::ffff:7f01:0203", IPv4(127, 1, 2, 3)},
 	{"0:0:0:0:0000:ffff:127.1.2.3", IPv4(127, 1, 2, 3)},
-	{"0:0:0:0:000000:ffff:127.1.2.3", IPv4(127, 1, 2, 3)},
 	{"0:0:0:0::ffff:127.1.2.3", IPv4(127, 1, 2, 3)},
 
 	{"2001:4860:0:2001::68", IP{0x20, 0x01, 0x48, 0x60, 0, 0, 0x20, 0x01, 0, 0, 0, 0, 0, 0, 0x00, 0x68}},
@@ -39,6 +36,10 @@ var parseIPTests = []struct {
 	{"fe80::1%lo0", nil},
 	{"fe80::1%911", nil},
 	{"", nil},
+	//6 zeroes in one group
+	{"0:0:0:0:000000:ffff:127.1.2.3", nil},
+	//5 zeroes in one group edge case
+	{"0:0:0:0:00000:ffff:127.1.2.3", nil},
 	{"a1:a2:a3:a4::b1:b2:b3:b4", nil}, // Issue 6628
 	{"127.001.002.003", nil},
 	{"::ffff:127.001.002.003", nil},
@@ -113,6 +114,22 @@ func BenchmarkParseIP(b *testing.B) {
 		for _, tt := range parseIPTests {
 			ParseIP(tt.in)
 		}
+	}
+}
+
+func BenchmarkParseIPValidIPv4(b *testing.B) {
+	testHookUninstaller.Do(uninstallTestHooks)
+
+	for i := 0; i < b.N; i++ {
+		ParseIP("192.0.2.1")
+	}
+}
+
+func BenchmarkParseIPValidIPv6(b *testing.B) {
+	testHookUninstaller.Do(uninstallTestHooks)
+
+	for i := 0; i < b.N; i++ {
+		ParseIP("2001:DB8::1")
 	}
 }
 
@@ -407,6 +424,7 @@ var ipNetStringTests = []struct {
 	{&IPNet{IP: IPv4(192, 168, 1, 0), Mask: IPv4Mask(255, 0, 255, 0)}, "192.168.1.0/ff00ff00"},
 	{&IPNet{IP: ParseIP("2001:db8::"), Mask: CIDRMask(55, 128)}, "2001:db8::/55"},
 	{&IPNet{IP: ParseIP("2001:db8::"), Mask: IPMask(ParseIP("8000:f123:0:cafe::"))}, "2001:db8::/8000f1230000cafe0000000000000000"},
+	{nil, "<nil>"},
 }
 
 func TestIPNetString(t *testing.T) {

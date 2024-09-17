@@ -7,8 +7,8 @@ package obj
 import (
 	"bytes"
 	"cmd/internal/objabi"
-	"cmd/internal/src"
 	"fmt"
+	"internal/abi"
 	"internal/buildcfg"
 	"io"
 	"strings"
@@ -46,10 +46,6 @@ func (p *Prog) InnermostFilename() string {
 		return "<unknown file name>"
 	}
 	return pos.Filename()
-}
-
-func (p *Prog) AllPos(result []src.Pos) []src.Pos {
-	return p.Ctxt.AllPos(p.Pos, result)
 }
 
 var armCondCode = []string{
@@ -202,6 +198,7 @@ func (p *Prog) WriteInstructionString(w io.Writer) {
 	if p.To.Type != TYPE_NONE {
 		io.WriteString(w, sep)
 		WriteDconv(w, p, &p.To)
+		sep = ", "
 	}
 	if p.RegTo2 != REG_NONE {
 		fmt.Fprintf(w, "%s%v", sep, Rconv(int(p.RegTo2)))
@@ -233,7 +230,7 @@ func Dconv(p *Prog, a *Addr) string {
 	return buf.String()
 }
 
-// DconvDconvWithABIDetail accepts an argument 'a' within a prog 'p'
+// DconvWithABIDetail accepts an argument 'a' within a prog 'p'
 // and returns a string with a formatted version of the argument, in
 // which text symbols are rendered with explicit ABI selectors.
 func DconvWithABIDetail(p *Prog, a *Addr) string {
@@ -312,7 +309,7 @@ func writeDconv(w io.Writer, p *Prog, a *Addr, abiDetail bool) {
 		}
 
 	case TYPE_TEXTSIZE:
-		if a.Val.(int32) == objabi.ArgsSizeUnknown {
+		if a.Val.(int32) == abi.ArgsSizeUnknown {
 			fmt.Fprintf(w, "$%d", a.Offset)
 		} else {
 			fmt.Fprintf(w, "$%d-%d", a.Offset, a.Val.(int32))
@@ -363,6 +360,9 @@ func writeDconv(w io.Writer, p *Prog, a *Addr, abiDetail bool) {
 
 	case TYPE_REGLIST:
 		io.WriteString(w, RLconv(a.Offset))
+
+	case TYPE_SPECIAL:
+		io.WriteString(w, SPCconv(a.Offset))
 	}
 }
 
@@ -504,15 +504,16 @@ var regSpace []regSet
 const (
 	// Because of masking operations in the encodings, each register
 	// space should start at 0 modulo some power of 2.
-	RBase386   = 1 * 1024
-	RBaseAMD64 = 2 * 1024
-	RBaseARM   = 3 * 1024
-	RBasePPC64 = 4 * 1024  // range [4k, 8k)
-	RBaseARM64 = 8 * 1024  // range [8k, 13k)
-	RBaseMIPS  = 13 * 1024 // range [13k, 14k)
-	RBaseS390X = 14 * 1024 // range [14k, 15k)
-	RBaseRISCV = 15 * 1024 // range [15k, 16k)
-	RBaseWasm  = 16 * 1024
+	RBase386     = 1 * 1024
+	RBaseAMD64   = 2 * 1024
+	RBaseARM     = 3 * 1024
+	RBasePPC64   = 4 * 1024  // range [4k, 8k)
+	RBaseARM64   = 8 * 1024  // range [8k, 13k)
+	RBaseMIPS    = 13 * 1024 // range [13k, 14k)
+	RBaseS390X   = 14 * 1024 // range [14k, 15k)
+	RBaseRISCV   = 15 * 1024 // range [15k, 16k)
+	RBaseWasm    = 16 * 1024
+	RBaseLOONG64 = 17 * 1024
 )
 
 // RegisterRegister binds a pretty-printer (Rconv) for register
@@ -575,6 +576,33 @@ func RLconv(list int64) string {
 	return fmt.Sprintf("RL???%d", list)
 }
 
+// Special operands
+type spcSet struct {
+	lo      int64
+	hi      int64
+	SPCconv func(int64) string
+}
+
+var spcSpace []spcSet
+
+// RegisterSpecialOperands binds a pretty-printer (SPCconv) for special
+// operand numbers to a given special operand number range. Lo is inclusive,
+// hi is exclusive (valid special operands are lo through hi-1).
+func RegisterSpecialOperands(lo, hi int64, rlconv func(int64) string) {
+	spcSpace = append(spcSpace, spcSet{lo, hi, rlconv})
+}
+
+// SPCconv returns the string representation of the special operand spc.
+func SPCconv(spc int64) string {
+	for i := range spcSpace {
+		spcs := &spcSpace[i]
+		if spcs.lo <= spc && spc < spcs.hi {
+			return spcs.SPCconv(spc)
+		}
+	}
+	return fmt.Sprintf("SPC???%d", spc)
+}
+
 type opSet struct {
 	lo    As
 	names []string
@@ -615,6 +643,7 @@ var Anames = []string{
 	"JMP",
 	"NOP",
 	"PCALIGN",
+	"PCALIGNMAX",
 	"PCDATA",
 	"RET",
 	"GETCALLERPC",
@@ -639,4 +668,63 @@ func abiDecorate(a *Addr, abiDetail bool) string {
 		return ""
 	}
 	return fmt.Sprintf("<%s>", a.Sym.ABI())
+}
+
+// AlignmentPadding bytes to add to align code as requested.
+// Alignment is restricted to powers of 2 between 8 and 2048 inclusive.
+//
+// pc_: current offset in function, in bytes
+// p:  a PCALIGN or PCALIGNMAX prog
+// ctxt: the context, for current function
+// cursym: current function being assembled
+// returns number of bytes of padding needed,
+// updates minimum alignment for the function.
+func AlignmentPadding(pc int32, p *Prog, ctxt *Link, cursym *LSym) int {
+	v := AlignmentPaddingLength(pc, p, ctxt)
+	requireAlignment(p.From.Offset, ctxt, cursym)
+	return v
+}
+
+// AlignmentPaddingLength is the number of bytes to add to align code as requested.
+// Alignment is restricted to powers of 2 between 8 and 2048 inclusive.
+// This only computes the length and does not update the (missing parameter)
+// current function's own required alignment.
+//
+// pc: current offset in function, in bytes
+// p:  a PCALIGN or PCALIGNMAX prog
+// ctxt: the context, for current function
+// returns number of bytes of padding needed,
+func AlignmentPaddingLength(pc int32, p *Prog, ctxt *Link) int {
+	a := p.From.Offset
+	if !((a&(a-1) == 0) && 8 <= a && a <= 2048) {
+		ctxt.Diag("alignment value of an instruction must be a power of two and in the range [8, 2048], got %d\n", a)
+		return 0
+	}
+	pc64 := int64(pc)
+	lob := pc64 & (a - 1) // Low Order Bits -- if not zero, then not aligned
+	if p.As == APCALIGN {
+		if lob != 0 {
+			return int(a - lob)
+		}
+		return 0
+	}
+	// emit as many as s bytes of padding to obtain alignment
+	s := p.To.Offset
+	if s < 0 || s >= a {
+		ctxt.Diag("PCALIGNMAX 'amount' %d must be non-negative and smaller than the aligment %d\n", s, a)
+		return 0
+	}
+	if s >= a-lob {
+		return int(a - lob)
+	}
+	return 0
+}
+
+// requireAlignment ensures that the function is aligned enough to support
+// the required code alignment
+func requireAlignment(a int64, ctxt *Link, cursym *LSym) {
+	// TODO remove explicit knowledge about AIX.
+	if ctxt.Headtype != objabi.Haix && cursym.Func().Align < int32(a) {
+		cursym.Func().Align = int32(a)
+	}
 }

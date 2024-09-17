@@ -4,10 +4,11 @@
 
 package math
 
-// Ldexp is the inverse of Frexp.
+// Ldexp is the inverse of [Frexp].
 // It returns frac × 2**exp.
 //
 // Special cases are:
+//
 //	Ldexp(±0, exp) = ±0
 //	Ldexp(±Inf, exp) = ±Inf
 //	Ldexp(NaN, exp) = NaN

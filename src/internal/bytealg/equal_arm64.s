@@ -5,58 +5,27 @@
 #include "go_asm.h"
 #include "textflag.h"
 
-// memequal(a, b unsafe.Pointer, size uintptr) bool
-TEXT runtime·memequal<ABIInternal>(SB),NOSPLIT|NOFRAME,$0-25
-#ifndef GOEXPERIMENT_regabiargs
-	MOVD	size+16(FP), R2
-#endif
-	// short path to handle 0-byte case
-	CBZ	R2, equal
-#ifndef GOEXPERIMENT_regabiargs
-	MOVD	a+0(FP), R0
-	MOVD	b+8(FP), R1
-	MOVD	$ret+24(FP), R8
-#endif
-	B	memeqbody<>(SB)
-equal:
-	MOVD	$1, R0
-#ifndef GOEXPERIMENT_regabiargs
-	MOVB	R0, ret+24(FP)
-#endif
-	RET
-
 // memequal_varlen(a, b unsafe.Pointer) bool
 TEXT runtime·memequal_varlen<ABIInternal>(SB),NOSPLIT,$0-17
-#ifndef GOEXPERIMENT_regabiargs
-	MOVD	a+0(FP), R0
-	MOVD	b+8(FP), R1
-#endif
-	CMP	R0, R1
-	BEQ	eq
 	MOVD	8(R26), R2    // compiler stores size at offset 8 in the closure
 	CBZ	R2, eq
-#ifndef GOEXPERIMENT_regabiargs
-	MOVD	$ret+16(FP), R8
-#endif
-	B	memeqbody<>(SB)
+	B	runtime·memequal<ABIInternal>(SB)
 eq:
 	MOVD	$1, R0
-#ifndef GOEXPERIMENT_regabiargs
-	MOVB	R0, ret+16(FP)
-#endif
 	RET
 
 // input:
 // R0: pointer a
 // R1: pointer b
 // R2: data len
-#ifdef GOEXPERIMENT_regabiargs
 // at return: result in R0
-#else
-// R8: address to put result
-#endif
-
-TEXT memeqbody<>(SB),NOSPLIT,$0
+// memequal(a, b unsafe.Pointer, size uintptr) bool
+TEXT runtime·memequal<ABIInternal>(SB),NOSPLIT|NOFRAME,$0-25
+	// short path to handle 0-byte case
+	CBZ     R2, equal
+	// short path to handle equal pointers
+	CMP     R0, R1
+	BEQ     equal
 	CMP	$1, R2
 	// handle 1-byte special case for better performance
 	BEQ	one
@@ -114,6 +83,7 @@ tail:
 	EOR	R4, R5
 	CBNZ	R5, not_equal
 	B	equal
+	PCALIGN	$16
 lt_8:
 	TBZ	$2, R2, lt_4
 	MOVWU	(R0), R4
@@ -126,6 +96,7 @@ lt_8:
 	EOR	R4, R5
 	CBNZ	R5, not_equal
 	B	equal
+	PCALIGN	$16
 lt_4:
 	TBZ	$1, R2, lt_2
 	MOVHU.P	2(R0), R4
@@ -141,14 +112,7 @@ one:
 	BNE	not_equal
 equal:
 	MOVD	$1, R0
-#ifndef GOEXPERIMENT_regabiargs
-	MOVB	R0, (R8)
-#endif
 	RET
 not_equal:
-#ifdef GOEXPERIMENT_regabiargs
 	MOVB	ZR, R0
-#else
-	MOVB	ZR, (R8)
-#endif
 	RET

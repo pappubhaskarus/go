@@ -34,7 +34,7 @@ var HelpPackages = &base.Command{
 	Long: `
 Many commands apply to a set of packages:
 
-	go action [packages]
+	go <action> [packages]
 
 Usually, [packages] is a list of import paths.
 
@@ -471,9 +471,9 @@ var HelpEnvironment = &base.Command{
 	Long: `
 
 The go command and the tools it invokes consult environment variables
-for configuration. If an environment variable is unset, the go command
-uses a sensible default setting. To see the effective setting of the
-variable <NAME>, run 'go env <NAME>'. To change the default setting,
+for configuration. If an environment variable is unset or empty, the go
+command uses a sensible default setting. To see the effective setting of
+the variable <NAME>, run 'go env <NAME>'. To change the default setting,
 run 'go env -w <NAME>=<VALUE>'. Defaults changed using 'go env -w'
 are recorded in a Go environment configuration file stored in the
 per-user configuration directory, as reported by os.UserConfigDir.
@@ -501,11 +501,13 @@ General-purpose environment variables:
 	GOMODCACHE
 		The directory where the go command will store downloaded modules.
 	GODEBUG
-		Enable various debugging facilities. See 'go doc runtime'
+		Enable various debugging facilities. See https://go.dev/doc/godebug
 		for details.
 	GOENV
 		The location of the Go environment configuration file.
 		Cannot be set using 'go env -w'.
+		Setting GOENV=off in the environment disables the use of the
+		default configuration file.
 	GOFLAGS
 		A space-separated list of -flag=value settings to apply
 		to go commands by default, when the given flag is known by
@@ -523,7 +525,7 @@ General-purpose environment variables:
 		The operating system for which to compile code.
 		Examples are linux, darwin, windows, netbsd.
 	GOPATH
-		For more details see: 'go help gopath'.
+		Controls where various files are stored. See: 'go help gopath'.
 	GOPROXY
 		URL of Go module proxy. See https://golang.org/ref/mod#environment-variables
 		and https://golang.org/ref/mod#module-proxy for details.
@@ -537,12 +539,22 @@ General-purpose environment variables:
 	GOSUMDB
 		The name of checksum database to use and optionally its public key and
 		URL. See https://golang.org/ref/mod#authenticating.
+	GOTOOLCHAIN
+		Controls which Go toolchain is used. See https://go.dev/doc/toolchain.
 	GOTMPDIR
 		The directory where the go command will write
 		temporary source files, packages, and binaries.
 	GOVCS
 		Lists version control commands that may be used with matching servers.
 		See 'go help vcs'.
+	GOWORK
+		In module aware mode, use the given go.work file as a workspace file.
+		By default or when GOWORK is "auto", the go command searches for a
+		file named go.work in the current directory and then containing directories
+		until one is found. If a valid go.work file is found, the modules
+		specified will collectively be used as the main modules. If GOWORK
+		is "off", or a go.work file is not found in "auto" mode, workspace
+		mode is disabled.
 
 Environment variables for use with cgo:
 
@@ -589,13 +601,22 @@ Architecture-specific environment variables:
 	GOARM
 		For GOARCH=arm, the ARM architecture for which to compile.
 		Valid values are 5, 6, 7.
+		The value can be followed by an option specifying how to implement floating point instructions.
+		Valid options are ,softfloat (default for 5) and ,hardfloat (default for 6 and 7).
+	GOARM64
+		For GOARCH=arm64, the ARM64 architecture for which to compile.
+		Valid values are v8.0 (default), v8.{1-9}, v9.{0-5}.
+		The value can be followed by an option specifying extensions implemented by target hardware.
+		Valid options are ,lse and ,crypto.
+		Note that some extensions are enabled by default starting from a certain GOARM64 version;
+		for example, lse is enabled by default starting from v8.1.
 	GO386
 		For GOARCH=386, how to implement floating point instructions.
 		Valid values are sse2 (default), softfloat.
 	GOAMD64
 		For GOARCH=amd64, the microarchitecture level for which to compile.
 		Valid values are v1 (default), v2, v3, v4.
-		See https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels.
+		See https://golang.org/wiki/MinimumRequirements#amd64
 	GOMIPS
 		For GOARCH=mips{,le}, whether to use floating point instructions.
 		Valid values are hardfloat (default), softfloat.
@@ -604,10 +625,21 @@ Architecture-specific environment variables:
 		Valid values are hardfloat (default), softfloat.
 	GOPPC64
 		For GOARCH=ppc64{,le}, the target ISA (Instruction Set Architecture).
-		Valid values are power8 (default), power9.
+		Valid values are power8 (default), power9, power10.
+	GORISCV64
+		For GOARCH=riscv64, the RISC-V user-mode application profile for which
+		to compile. Valid values are rva20u64 (default), rva22u64.
+		See https://github.com/riscv/riscv-profiles/blob/main/src/profiles.adoc
 	GOWASM
 		For GOARCH=wasm, comma-separated list of experimental WebAssembly features to use.
 		Valid values are satconv, signext.
+
+Environment variables for use with code coverage:
+
+	GOCOVERDIR
+		Directory into which to write code coverage data files
+		generated by running a "go build -cover" binary.
+		Requires that GOEXPERIMENT=coverageredesign is enabled.
 
 Special-purpose environment variables:
 
@@ -620,11 +652,6 @@ Special-purpose environment variables:
 		See src/internal/goexperiment/flags.go for currently valid values.
 		Warning: This variable is provided for the development and testing
 		of the Go toolchain itself. Use beyond that purpose is unsupported.
-	GOROOT_FINAL
-		The root of the installed Go tree, when it is
-		installed in a location other than where it is built.
-		File names in stack traces are rewritten from GOROOT to
-		GOROOT_FINAL.
 	GO_EXTLINK_ENABLED
 		Whether the linker should use external linking mode
 		when using -linkmode=auto with code that uses cgo.
@@ -651,6 +678,11 @@ Additional information available from 'go env' but not read from the environment
 		If module-aware mode is enabled, but there is no go.mod, GOMOD will be
 		os.DevNull ("/dev/null" on Unix-like systems, "NUL" on Windows).
 		If module-aware mode is disabled, GOMOD will be the empty string.
+	GOTELEMETRY
+		The current Go telemetry mode ("off", "local", or "on").
+		See "go help telemetry" for more information.
+	GOTELEMETRYDIR
+		The directory Go telemetry data is written is written to.
 	GOTOOLDIR
 		The directory where the go tools (compile, cover, doc, etc...) are installed.
 	GOVERSION
@@ -802,22 +834,26 @@ var HelpBuildConstraint = &base.Command{
 	UsageLine: "buildconstraint",
 	Short:     "build constraints",
 	Long: `
-A build constraint, also known as a build tag, is a line comment that begins
+A build constraint, also known as a build tag, is a condition under which a
+file should be included in the package. Build constraints are given by a
+line comment that begins
 
 	//go:build
 
-that lists the conditions under which a file should be included in the package.
+Build constraints can also be used to downgrade the language version
+used to compile a file.
+
 Constraints may appear in any kind of source file (not just Go), but
 they must appear near the top of the file, preceded
-only by blank lines and other line comments. These rules mean that in Go
+only by blank lines and other comments. These rules mean that in Go
 files a build constraint must appear before the package clause.
 
 To distinguish build constraints from package documentation,
 a build constraint should be followed by a blank line.
 
-A build constraint is evaluated as an expression containing options
-combined by ||, &&, and ! operators and parentheses. Operators have
-the same meaning as in Go.
+A build constraint comment is evaluated as an expression containing
+build tags combined by ||, &&, and ! operators and parentheses.
+Operators have the same meaning as in Go.
 
 For example, the following build constraint constrains a file to
 build when the "linux" and "386" constraints are satisfied, or when
@@ -827,12 +863,15 @@ build when the "linux" and "386" constraints are satisfied, or when
 
 It is an error for a file to have more than one //go:build line.
 
-During a particular build, the following words are satisfied:
+During a particular build, the following build tags are satisfied:
 
 	- the target operating system, as spelled by runtime.GOOS, set with the
 	  GOOS environment variable.
 	- the target architecture, as spelled by runtime.GOARCH, set with the
 	  GOARCH environment variable.
+	- any architecture features, in the form GOARCH.feature
+	  (for example, "amd64.v2"), as detailed below.
+	- "unix", if GOOS is a Unix or Unix-like system.
 	- the compiler being used, either "gc" or "gccgo"
 	- "cgo", if the cgo command is supported (see CGO_ENABLED in
 	  'go help environment').
@@ -861,11 +900,50 @@ in addition to illumos tags and files.
 Using GOOS=ios matches build tags and files as for GOOS=darwin
 in addition to ios tags and files.
 
-To keep a file from being considered for the build:
+The defined architecture feature build tags are:
+
+	- For GOARCH=386, GO386=387 and GO386=sse2
+	  set the 386.387 and 386.sse2 build tags, respectively.
+	- For GOARCH=amd64, GOAMD64=v1, v2, and v3
+	  correspond to the amd64.v1, amd64.v2, and amd64.v3 feature build tags.
+	- For GOARCH=arm, GOARM=5, 6, and 7
+	  correspond to the arm.5, arm.6, and arm.7 feature build tags.
+	- For GOARCH=arm64, GOARM64=v8.{0-9} and v9.{0-5}
+	  correspond to the arm64.v8.{0-9} and arm64.v9.{0-5} feature build tags.
+	- For GOARCH=mips or mipsle,
+	  GOMIPS=hardfloat and softfloat
+	  correspond to the mips.hardfloat and mips.softfloat
+	  (or mipsle.hardfloat and mipsle.softfloat) feature build tags.
+	- For GOARCH=mips64 or mips64le,
+	  GOMIPS64=hardfloat and softfloat
+	  correspond to the mips64.hardfloat and mips64.softfloat
+	  (or mips64le.hardfloat and mips64le.softfloat) feature build tags.
+	- For GOARCH=ppc64 or ppc64le,
+	  GOPPC64=power8, power9, and power10 correspond to the
+	  ppc64.power8, ppc64.power9, and ppc64.power10
+	  (or ppc64le.power8, ppc64le.power9, and ppc64le.power10)
+	  feature build tags.
+	- For GOARCH=riscv64,
+	  GORISCV64=rva20u64 and rva22u64 correspond to the riscv64.rva20u64
+	  and riscv64.rva22u64 build tags.
+	- For GOARCH=wasm, GOWASM=satconv and signext
+	  correspond to the wasm.satconv and wasm.signext feature build tags.
+
+For GOARCH=amd64, arm, ppc64, ppc64le, and riscv64, a particular feature level
+sets the feature build tags for all previous levels as well.
+For example, GOAMD64=v2 sets the amd64.v1 and amd64.v2 feature flags.
+This ensures that code making use of v2 features continues to compile
+when, say, GOAMD64=v4 is introduced.
+Code handling the absence of a particular feature level
+should use a negation:
+
+	//go:build !amd64.v2
+
+To keep a file from being considered for any build:
 
 	//go:build ignore
 
-(any other unsatisfied word will work as well, but "ignore" is conventional.)
+(Any other unsatisfied word will work as well, but "ignore" is conventional.)
 
 To build a file only when using cgo, and only on Linux and OS X:
 
@@ -884,5 +962,9 @@ only when building the package for 32-bit x86.
 Go versions 1.16 and earlier used a different syntax for build constraints,
 with a "// +build" prefix. The gofmt command will add an equivalent //go:build
 constraint when encountering the older syntax.
+
+In modules with a Go version of 1.21 or later, if a file's build constraint
+has a term for a Go major release, the language version used when compiling
+the file will be the minimum version implied by the build constraint.
 `,
 }

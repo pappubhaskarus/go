@@ -9,24 +9,15 @@ package rand
 
 import (
 	"internal/syscall/windows"
-	"os"
 )
 
 func init() { Reader = &rngReader{} }
 
 type rngReader struct{}
 
-func (r *rngReader) Read(b []byte) (n int, err error) {
-	// RtlGenRandom only accepts 2**32-1 bytes at a time, so truncate.
-	inputLen := uint32(len(b))
-
-	if inputLen == 0 {
-		return 0, nil
+func (r *rngReader) Read(b []byte) (int, error) {
+	if err := windows.ProcessPrng(b); err != nil {
+		return 0, err
 	}
-
-	err = windows.RtlGenRandom(b)
-	if err != nil {
-		return 0, os.NewSyscallError("RtlGenRandom", err)
-	}
-	return int(inputLen), nil
+	return len(b), nil
 }

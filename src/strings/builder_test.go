@@ -109,6 +109,15 @@ func TestBuilderGrow(t *testing.T) {
 			t.Errorf("growLen=%d: got %d allocs during Write; want %v", growLen, g, w)
 		}
 	}
+	// when growLen < 0, should panic
+	var a Builder
+	n := -1
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf("a.Grow(%d) should panic()", n)
+		}
+	}()
+	a.Grow(n)
 }
 
 func TestBuilderWrite2(t *testing.T) {
@@ -346,6 +355,22 @@ func BenchmarkBuildString_Builder(b *testing.B) {
 	})
 }
 
+func BenchmarkBuildString_WriteString(b *testing.B) {
+	someString := string(someBytes)
+	benchmarkBuilder(b, func(b *testing.B, numWrite int, grow bool) {
+		for i := 0; i < b.N; i++ {
+			var buf Builder
+			if grow {
+				buf.Grow(len(someString) * numWrite)
+			}
+			for i := 0; i < numWrite; i++ {
+				buf.WriteString(someString)
+			}
+			sinkS = buf.String()
+		}
+	})
+}
+
 func BenchmarkBuildString_ByteBuffer(b *testing.B) {
 	benchmarkBuilder(b, func(b *testing.B, numWrite int, grow bool) {
 		for i := 0; i < b.N; i++ {
@@ -359,4 +384,17 @@ func BenchmarkBuildString_ByteBuffer(b *testing.B) {
 			sinkS = buf.String()
 		}
 	})
+}
+
+func TestBuilderGrowSizeclasses(t *testing.T) {
+	s := Repeat("a", 19)
+	allocs := testing.AllocsPerRun(100, func() {
+		var b Builder
+		b.Grow(18)
+		b.WriteString(s)
+		_ = b.String()
+	})
+	if allocs > 1 {
+		t.Fatalf("unexpected amount of allocations: %v, want: 1", allocs)
+	}
 }

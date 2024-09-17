@@ -7,7 +7,7 @@
 package runtime
 
 import (
-	"runtime/internal/atomic"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
@@ -23,7 +23,6 @@ import (
 //
 //	func semawakeup(mp *m)
 //		Wake up mp, which is or will soon be sleeping on its semaphore.
-//
 const (
 	locked uintptr = 1
 
@@ -31,6 +30,10 @@ const (
 	active_spin_cnt = 30
 	passive_spin    = 1
 )
+
+func mutexContended(l *mutex) bool {
+	return atomic.Loaduintptr(&l.key) > locked
+}
 
 func lock(l *mutex) {
 	lockWithRank(l, getLockRank(l))
@@ -49,6 +52,8 @@ func lock2(l *mutex) {
 	}
 	semacreate(gp.m)
 
+	timer := &lockTimer{lock: l}
+	timer.begin()
 	// On uniprocessor's, no point spinning.
 	// On multiprocessors, spin for ACTIVE_SPIN attempts.
 	spin := 0
@@ -61,6 +66,7 @@ Loop:
 		if v&locked == 0 {
 			// Unlocked. Try to lock.
 			if atomic.Casuintptr(&l.key, v, v|locked) {
+				timer.end()
 				return
 			}
 			i = 0
@@ -97,8 +103,9 @@ func unlock(l *mutex) {
 	unlockWithRank(l)
 }
 
-//go:nowritebarrier
 // We might not be holding a p in this code.
+//
+//go:nowritebarrier
 func unlock2(l *mutex) {
 	gp := getg()
 	var mp *m
@@ -119,6 +126,7 @@ func unlock2(l *mutex) {
 			}
 		}
 	}
+	gp.m.mLockProfile.recordUnlock(l)
 	gp.m.locks--
 	if gp.m.locks < 0 {
 		throw("runtime·unlock: lock count")
@@ -130,13 +138,7 @@ func unlock2(l *mutex) {
 
 // One-time notifications.
 func noteclear(n *note) {
-	if GOOS == "aix" {
-		// On AIX, semaphores might not synchronize the memory in some
-		// rare cases. See issue #30189.
-		atomic.Storeuintptr(&n.key, 0)
-	} else {
-		n.key = 0
-	}
+	n.key = 0
 }
 
 func notewakeup(n *note) {
@@ -284,7 +286,7 @@ func notetsleep(n *note, ns int64) bool {
 }
 
 // same as runtime·notetsleep, but called on user g (not g0)
-// calls only nosplit functions between entersyscallblock/exitsyscall
+// calls only nosplit functions between entersyscallblock/exitsyscall.
 func notetsleepg(n *note, ns int64) bool {
 	gp := getg()
 	if gp == gp.m.g0 {

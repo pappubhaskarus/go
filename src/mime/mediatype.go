@@ -7,7 +7,7 @@ package mime
 import (
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -37,7 +37,7 @@ func FormatMediaType(t string, param map[string]string) string {
 	for a := range param {
 		attrs = append(attrs, a)
 	}
-	sort.Strings(attrs)
+	slices.Sort(attrs)
 
 	for _, attribute := range attrs {
 		value := param[attribute]
@@ -121,7 +121,7 @@ func checkMediaTypeDisposition(s string) error {
 	return nil
 }
 
-// ErrInvalidMediaParameter is returned by ParseMediaType if
+// ErrInvalidMediaParameter is returned by [ParseMediaType] if
 // the media type value was found but there was an error parsing
 // the optional parameters
 var ErrInvalidMediaParameter = errors.New("mime: invalid media parameter")
@@ -133,7 +133,7 @@ var ErrInvalidMediaParameter = errors.New("mime: invalid media parameter")
 // to lowercase and trimmed of white space and a non-nil map.
 // If there is an error parsing the optional parameter,
 // the media type will be returned along with the error
-// ErrInvalidMediaParameter.
+// [ErrInvalidMediaParameter].
 // The returned map, params, maps from the lowercase
 // attribute to the attribute value with its case preserved.
 func ParseMediaType(v string) (mediatype string, params map[string]string, err error) {
@@ -180,8 +180,8 @@ func ParseMediaType(v string) (mediatype string, params map[string]string, err e
 				pmap = continuation[baseName]
 			}
 		}
-		if _, exists := pmap[key]; exists {
-			// Duplicate parameter name is bogus.
+		if v, exists := pmap[key]; exists && v != value {
+			// Duplicate parameter names are incorrect, but we allow them if they are equal.
 			return "", nil, errors.New("mime: duplicate parameter name")
 		}
 		pmap[key] = value

@@ -8,6 +8,8 @@ import "fmt"
 
 // PosMax is the largest line or column value that can be represented without loss.
 // Incoming values (arguments) larger than PosMax will be set to PosMax.
+//
+// Keep this consistent with maxLineCol in go/scanner.
 const PosMax = 1 << 30
 
 // A Pos represents an absolute (line, col) source position
@@ -24,13 +26,25 @@ type Pos struct {
 func MakePos(base *PosBase, line, col uint) Pos { return Pos{base, sat32(line), sat32(col)} }
 
 // TODO(gri) IsKnown makes an assumption about linebase < 1.
-//           Maybe we should check for Base() != nil instead.
+// Maybe we should check for Base() != nil instead.
 
 func (pos Pos) Pos() Pos       { return pos }
 func (pos Pos) IsKnown() bool  { return pos.line > 0 }
 func (pos Pos) Base() *PosBase { return pos.base }
 func (pos Pos) Line() uint     { return uint(pos.line) }
 func (pos Pos) Col() uint      { return uint(pos.col) }
+
+// FileBase returns the PosBase of the file containing pos,
+// skipping over intermediate PosBases from //line directives.
+// The result is nil if pos doesn't have a file base.
+func (pos Pos) FileBase() *PosBase {
+	b := pos.base
+	for b != nil && b != b.pos.base {
+		b = b.pos.base
+	}
+	// b == nil || b == b.pos.base
+	return b
+}
 
 func (pos Pos) RelFilename() string { return pos.base.Filename() }
 

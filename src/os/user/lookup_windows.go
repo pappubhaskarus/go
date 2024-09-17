@@ -5,9 +5,11 @@
 package user
 
 import (
+	"errors"
 	"fmt"
 	"internal/syscall/windows"
 	"internal/syscall/windows/registry"
+	"runtime"
 	"syscall"
 	"unsafe"
 )
@@ -116,7 +118,7 @@ func lookupGroupName(groupname string) (string, error) {
 	if e != nil {
 		return "", e
 	}
-	// https://msdn.microsoft.com/en-us/library/cc245478.aspx#gt_0387e636-5654-4910-9519-1f8326cf5ec0
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-samr/7b2aeb27-92fc-41f6-8437-deb65d950921#gt_0387e636-5654-4910-9519-1f8326cf5ec0
 	// SidTypeAlias should also be treated as a group type next to SidTypeGroup
 	// and SidTypeWellKnownGroup:
 	// "alias object -> resource group: A group object..."
@@ -145,21 +147,17 @@ func listGroupsForUsernameAndDomain(username, domain string) ([]string, error) {
 	}
 	var p0 *byte
 	var entriesRead, totalEntries uint32
-	// https://msdn.microsoft.com/en-us/library/windows/desktop/aa370655(v=vs.85).aspx
+	// https://learn.microsoft.com/en-us/windows/win32/api/lmaccess/nf-lmaccess-netusergetlocalgroups
 	// NetUserGetLocalGroups() would return a list of LocalGroupUserInfo0
 	// elements which hold the names of local groups where the user participates.
 	// The list does not follow any sorting order.
-	//
-	// If no groups can be found for this user, NetUserGetLocalGroups() should
-	// always return the SID of a single group called "None", which
-	// also happens to be the primary group for the local user.
 	err = windows.NetUserGetLocalGroups(nil, q, 0, windows.LG_INCLUDE_INDIRECT, &p0, windows.MAX_PREFERRED_LENGTH, &entriesRead, &totalEntries)
 	if err != nil {
 		return nil, err
 	}
 	defer syscall.NetApiBufferFree(p0)
 	if entriesRead == 0 {
-		return nil, fmt.Errorf("listGroupsForUsernameAndDomain: NetUserGetLocalGroups() returned an empty list for domain: %s, username: %s", domain, username)
+		return nil, nil
 	}
 	entries := (*[1024]windows.LocalGroupUserInfo0)(unsafe.Pointer(p0))[:entriesRead:entriesRead]
 	var sids []string
@@ -192,37 +190,111 @@ func newUser(uid, gid, dir, username, domain string) (*User, error) {
 	return u, nil
 }
 
+var (
+	// unused variables (in this implementation)
+	// modified during test to exercise code paths in the cgo implementation.
+	userBuffer  = 0
+	groupBuffer = 0
+)
+
 func current() (*User, error) {
-	t, e := syscall.OpenCurrentProcessToken()
-	if e != nil {
-		return nil, e
+	// Use runAsProcessOwner to ensure that we can access the process token
+	// when calling syscall.OpenCurrentProcessToken if the current thread
+	// is impersonating a different user. See https://go.dev/issue/68647.
+	var usr *User
+	err := runAsProcessOwner(func() error {
+		t, e := syscall.OpenCurrentProcessToken()
+		if e != nil {
+			return e
+		}
+		defer t.Close()
+		u, e := t.GetTokenUser()
+		if e != nil {
+			return e
+		}
+		pg, e := t.GetTokenPrimaryGroup()
+		if e != nil {
+			return e
+		}
+		uid, e := u.User.Sid.String()
+		if e != nil {
+			return e
+		}
+		gid, e := pg.PrimaryGroup.String()
+		if e != nil {
+			return e
+		}
+		dir, e := t.GetUserProfileDirectory()
+		if e != nil {
+			return e
+		}
+		username, e := windows.GetUserName(syscall.NameSamCompatible)
+		if e != nil {
+			return e
+		}
+		displayName, e := windows.GetUserName(syscall.NameDisplay)
+		if e != nil {
+			// Historically, the username is used as fallback
+			// when the display name can't be retrieved.
+			displayName = username
+		}
+		usr = &User{
+			Uid:      uid,
+			Gid:      gid,
+			Username: username,
+			Name:     displayName,
+			HomeDir:  dir,
+		}
+		return nil
+	})
+	return usr, err
+}
+
+// runAsProcessOwner runs f in the context of the current process owner,
+// that is, removing any impersonation that may be in effect before calling f,
+// and restoring the impersonation afterwards.
+func runAsProcessOwner(f func() error) error {
+	var impersonationRollbackErr error
+	runtime.LockOSThread()
+	defer func() {
+		// If impersonation failed, the thread is running with the wrong token,
+		// so it's better to terminate it.
+		// This is achieved by not calling runtime.UnlockOSThread.
+		if impersonationRollbackErr != nil {
+			println("os/user: failed to revert to previous token:", impersonationRollbackErr.Error())
+			runtime.Goexit()
+		} else {
+			runtime.UnlockOSThread()
+		}
+	}()
+	prevToken, isProcessToken, err := getCurrentToken()
+	if err != nil {
+		return fmt.Errorf("os/user: failed to get current token: %w", err)
 	}
-	defer t.Close()
-	u, e := t.GetTokenUser()
-	if e != nil {
-		return nil, e
+	defer prevToken.Close()
+	if !isProcessToken {
+		if err = windows.RevertToSelf(); err != nil {
+			return fmt.Errorf("os/user: failed to revert to self: %w", err)
+		}
+		defer func() {
+			impersonationRollbackErr = windows.ImpersonateLoggedOnUser(prevToken)
+		}()
 	}
-	pg, e := t.GetTokenPrimaryGroup()
-	if e != nil {
-		return nil, e
+	return f()
+}
+
+// getCurrentToken returns the current thread token, or
+// the process token if the thread doesn't have a token.
+func getCurrentToken() (t syscall.Token, isProcessToken bool, err error) {
+	thread, _ := windows.GetCurrentThread()
+	// Need TOKEN_DUPLICATE and TOKEN_IMPERSONATE to use the token in ImpersonateLoggedOnUser.
+	err = windows.OpenThreadToken(thread, syscall.TOKEN_QUERY|syscall.TOKEN_DUPLICATE|syscall.TOKEN_IMPERSONATE, true, &t)
+	if errors.Is(err, windows.ERROR_NO_TOKEN) {
+		// Not impersonating, use the process token.
+		isProcessToken = true
+		t, err = syscall.OpenCurrentProcessToken()
 	}
-	uid, e := u.User.Sid.String()
-	if e != nil {
-		return nil, e
-	}
-	gid, e := pg.PrimaryGroup.String()
-	if e != nil {
-		return nil, e
-	}
-	dir, e := t.GetUserProfileDirectory()
-	if e != nil {
-		return nil, e
-	}
-	username, domain, e := lookupUsernameAndDomain(u.User.Sid)
-	if e != nil {
-		return nil, e
-	}
-	return newUser(uid, gid, dir, username, domain)
+	return t, isProcessToken, err
 }
 
 // lookupUserPrimaryGroup obtains the primary group SID for a user using this method:
@@ -248,7 +320,7 @@ func lookupUserPrimaryGroup(username, domain string) (string, error) {
 	//
 	// The correct way to obtain the primary group of a domain user is
 	// probing the user primaryGroupID attribute in the server Active Directory:
-	// https://msdn.microsoft.com/en-us/library/ms679375(v=vs.85).aspx
+	// https://learn.microsoft.com/en-us/windows/win32/adschema/a-primarygroupid
 	//
 	// Note that the primary group of domain users should not be modified
 	// on Windows for performance reasons, even if it's possible to do that.
@@ -362,17 +434,45 @@ func lookupGroupId(gid string) (*Group, error) {
 }
 
 func listGroups(user *User) ([]string, error) {
-	sid, err := syscall.StringToSid(user.Uid)
-	if err != nil {
-		return nil, err
-	}
-	username, domain, err := lookupUsernameAndDomain(sid)
-	if err != nil {
-		return nil, err
-	}
-	sids, err := listGroupsForUsernameAndDomain(username, domain)
-	if err != nil {
-		return nil, err
+	var sids []string
+	if u, err := Current(); err == nil && u.Uid == user.Uid {
+		// It is faster and more reliable to get the groups
+		// of the current user from the current process token.
+		err := runAsProcessOwner(func() error {
+			t, err := syscall.OpenCurrentProcessToken()
+			if err != nil {
+				return err
+			}
+			defer t.Close()
+			groups, err := windows.GetTokenGroups(t)
+			if err != nil {
+				return err
+			}
+			for _, g := range groups.AllGroups() {
+				sid, err := g.Sid.String()
+				if err != nil {
+					return err
+				}
+				sids = append(sids, sid)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		sid, err := syscall.StringToSid(user.Uid)
+		if err != nil {
+			return nil, err
+		}
+		username, domain, err := lookupUsernameAndDomain(sid)
+		if err != nil {
+			return nil, err
+		}
+		sids, err = listGroupsForUsernameAndDomain(username, domain)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// Add the primary group of the user to the list if it is not already there.
 	// This is done only to comply with the POSIX concept of a primary group.

@@ -15,9 +15,11 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"internal/saferio"
 	"io"
+	"math"
 	"math/big"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -53,7 +55,7 @@ const (
 )
 
 type ident struct {
-	pkg  string
+	pkg  *types.Package
 	name string
 }
 
@@ -75,6 +77,7 @@ const (
 	typeParamType
 	instanceType
 	unionType
+	aliasType
 )
 
 // iImportData imports a package from the serialized package data
@@ -103,12 +106,16 @@ func iImportData(fset *token.FileSet, imports map[string]*types.Package, dataRea
 		errorf("unknown iexport format version %d", version)
 	}
 
-	sLen := int64(r.uint64())
-	dLen := int64(r.uint64())
+	sLen := r.uint64()
+	dLen := r.uint64()
 
-	data := make([]byte, sLen+dLen)
-	if _, err := io.ReadFull(r, data); err != nil {
-		errorf("cannot read %d bytes of stringData and declData: %s", len(data), err)
+	if sLen > math.MaxUint64-dLen {
+		errorf("lengths out of range (%d, %d)", sLen, dLen)
+	}
+
+	data, err := saferio.ReadData(r, sLen+dLen)
+	if err != nil {
+		errorf("cannot read %d bytes of stringData and declData: %s", sLen+dLen, err)
 	}
 	stringData := data[:sLen]
 	declData := data[sLen:]
@@ -127,7 +134,7 @@ func iImportData(fset *token.FileSet, imports map[string]*types.Package, dataRea
 		typCache: make(map[uint64]types.Type),
 		// Separate map for typeparams, keyed by their package and unique
 		// name (name with subscript).
-		tparamIndex: make(map[ident]types.Type),
+		tparamIndex: make(map[ident]*types.TypeParam),
 
 		fake: fakeFileSet{
 			fset:  fset,
@@ -139,6 +146,9 @@ func iImportData(fset *token.FileSet, imports map[string]*types.Package, dataRea
 	for i, pt := range predeclared {
 		p.typCache[uint64(i)] = pt
 	}
+	// Special handling for "any", whose representation may be changed by the
+	// gotypesalias GODEBUG variable.
+	p.typCache[uint64(len(predeclared))] = types.Universe.Lookup("any").Type()
 
 	pkgList := make([]*types.Package, r.uint64())
 	for i := range pkgList {
@@ -176,9 +186,18 @@ func iImportData(fset *token.FileSet, imports map[string]*types.Package, dataRea
 	for name := range p.pkgIndex[localpkg] {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	for _, name := range names {
 		p.doDecl(localpkg, name)
+	}
+
+	// SetConstraint can't be called if the constraint type is not yet complete.
+	// When type params are created in the 'P' case of (*importReader).obj(),
+	// the associated constraint type may not be complete due to recursion.
+	// Therefore, we defer calling SetConstraint there, and call it here instead
+	// after all types are complete.
+	for _, d := range p.later {
+		d.t.SetConstraint(d.constraint)
 	}
 
 	for _, typ := range p.interfaceList {
@@ -187,12 +206,19 @@ func iImportData(fset *token.FileSet, imports map[string]*types.Package, dataRea
 
 	// record all referenced packages as imports
 	list := append(([]*types.Package)(nil), pkgList[1:]...)
-	sort.Sort(byPath(list))
+	slices.SortFunc(list, func(a, b *types.Package) int {
+		return strings.Compare(a.Path(), b.Path())
+	})
 	localpkg.SetImports(list)
 
 	// package was imported completely and without errors
 	localpkg.MarkComplete()
 	return localpkg, nil
+}
+
+type setConstraintArgs struct {
+	t          *types.TypeParam
+	constraint types.Type
 }
 
 type iimporter struct {
@@ -207,10 +233,13 @@ type iimporter struct {
 	declData    []byte
 	pkgIndex    map[*types.Package]map[string]uint64
 	typCache    map[uint64]types.Type
-	tparamIndex map[ident]types.Type
+	tparamIndex map[ident]*types.TypeParam
 
 	fake          fakeFileSet
 	interfaceList []*types.Interface
+
+	// Arguments for calls to SetConstraint that are deferred due to recursive types
+	later []setConstraintArgs
 }
 
 func (p *iimporter) doDecl(pkg *types.Package, name string) {
@@ -305,10 +334,13 @@ func (r *importReader) obj(name string) {
 	pos := r.pos()
 
 	switch tag {
-	case 'A':
-		typ := r.typ()
-
-		r.declare(types.NewTypeName(pos, r.currPkg, name, typ))
+	case 'A', 'B':
+		var tparams []*types.TypeParam
+		if tag == 'B' {
+			tparams = r.tparamList()
+		}
+		rhs := r.typ()
+		r.declare(newAliasTypeName(pos, r.currPkg, name, rhs, tparams))
 
 	case 'C':
 		typ, val := r.value()
@@ -325,7 +357,7 @@ func (r *importReader) obj(name string) {
 
 	case 'T', 'U':
 		// Types can be recursive. We need to setup a stub
-		// declaration before recursing.
+		// declaration before recurring.
 		obj := types.NewTypeName(pos, r.currPkg, name, nil)
 		named := types.NewNamed(obj, nil, nil)
 		// Declare obj before calling r.tparamList, so the new type name is recognized
@@ -369,16 +401,14 @@ func (r *importReader) obj(name string) {
 		if r.p.exportVersion < iexportVersionGenerics {
 			errorf("unexpected type param type")
 		}
-		// Remove the "path" from the type param name that makes it unique
-		ix := strings.LastIndex(name, ".")
-		if ix < 0 {
-			errorf("missing path for type param")
-		}
-		tn := types.NewTypeName(pos, r.currPkg, name[ix+1:], nil)
+		// Remove the "path" from the type param name that makes it unique,
+		// and revert any unique name used for blank typeparams.
+		name0 := tparamName(name)
+		tn := types.NewTypeName(pos, r.currPkg, name0, nil)
 		t := types.NewTypeParam(tn, nil)
 		// To handle recursive references to the typeparam within its
 		// bound, save the partial type in tparamIndex before reading the bounds.
-		id := ident{r.currPkg.Name(), name}
+		id := ident{r.currPkg, name}
 		r.p.tparamIndex[id] = t
 
 		var implicit bool
@@ -393,7 +423,11 @@ func (r *importReader) obj(name string) {
 			}
 			iface.MarkImplicit()
 		}
-		t.SetConstraint(constraint)
+		// The constraint type may not be complete, if we
+		// are in the middle of a type recursion involving type
+		// constraints. So, we defer SetConstraint until we have
+		// completely set up all types in ImportData.
+		r.p.later = append(r.p.later, setConstraintArgs{t: t, constraint: constraint})
 
 	case 'V':
 		typ := r.typ()
@@ -586,7 +620,7 @@ func (r *importReader) doType(base *types.Named) types.Type {
 		errorf("unexpected kind tag in %q: %v", r.p.ipath, k)
 		return nil
 
-	case definedType:
+	case aliasType, definedType:
 		pkg, name := r.qualifiedIdent()
 		r.p.doDecl(pkg, name)
 		return pkg.Scope().Lookup(name).(*types.TypeName).Type()
@@ -657,7 +691,7 @@ func (r *importReader) doType(base *types.Named) types.Type {
 			errorf("unexpected type param type")
 		}
 		pkg, name := r.qualifiedIdent()
-		id := ident{pkg.Name(), name}
+		id := ident{pkg, name}
 		if t, ok := r.p.tparamIndex[id]; ok {
 			// We're already in the process of importing this typeparam.
 			return t
@@ -771,4 +805,22 @@ func baseType(typ types.Type) *types.Named {
 	// receiver base types are always (possibly generic) types.Named types
 	n, _ := typ.(*types.Named)
 	return n
+}
+
+const blankMarker = "$"
+
+// tparamName returns the real name of a type parameter, after stripping its
+// qualifying prefix and reverting blank-name encoding. See tparamExportName
+// for details.
+func tparamName(exportName string) string {
+	// Remove the "path" from the type param name that makes it unique.
+	ix := strings.LastIndex(exportName, ".")
+	if ix < 0 {
+		errorf("malformed type parameter export name %s: missing prefix", exportName)
+	}
+	name := exportName[ix+1:]
+	if strings.HasPrefix(name, blankMarker) {
+		return "_"
+	}
+	return name
 }

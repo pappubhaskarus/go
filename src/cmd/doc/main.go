@@ -5,20 +5,25 @@
 // Doc (usually run as go doc) accepts zero, one or two arguments.
 //
 // Zero arguments:
+//
 //	go doc
+//
 // Show the documentation for the package in the current directory.
 //
 // One argument:
+//
 //	go doc <pkg>
 //	go doc <sym>[.<methodOrField>]
 //	go doc [<pkg>.]<sym>[.<methodOrField>]
 //	go doc [<pkg>.][<sym>.]<methodOrField>
+//
 // The first item in this list that succeeds is the one whose documentation
 // is printed. If there is a symbol but no package, the package in the current
 // directory is chosen. However, if the argument begins with a capital
 // letter it is always assumed to be a symbol in the current directory.
 //
 // Two arguments:
+//
 //	go doc <pkg> <sym>[.<methodOrField>]
 //
 // Show the documentation for the package, symbol, and method or field. The
@@ -49,15 +54,18 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"cmd/internal/telemetry/counter"
 )
 
 var (
-	unexported bool // -u flag
-	matchCase  bool // -c flag
-	showAll    bool // -all flag
-	showCmd    bool // -cmd flag
-	showSrc    bool // -src flag
-	short      bool // -short flag
+	unexported bool   // -u flag
+	matchCase  bool   // -c flag
+	chdir      string // -C flag
+	showAll    bool   // -all flag
+	showCmd    bool   // -cmd flag
+	showSrc    bool   // -src flag
+	short      bool   // -short flag
 )
 
 // usage is a replacement usage function for the flags package.
@@ -79,6 +87,7 @@ func usage() {
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("doc: ")
+	counter.Open()
 	dirsInit()
 	err := do(os.Stdout, flag.CommandLine, os.Args[1:])
 	if err != nil {
@@ -91,6 +100,7 @@ func do(writer io.Writer, flagSet *flag.FlagSet, args []string) (err error) {
 	flagSet.Usage = usage
 	unexported = false
 	matchCase = false
+	flagSet.StringVar(&chdir, "C", "", "change to `dir` before running command")
 	flagSet.BoolVar(&unexported, "u", false, "show unexported symbols as well as exported")
 	flagSet.BoolVar(&matchCase, "c", false, "symbol matching honors case (paths not affected)")
 	flagSet.BoolVar(&showAll, "all", false, "show all documentation for package")
@@ -98,6 +108,13 @@ func do(writer io.Writer, flagSet *flag.FlagSet, args []string) (err error) {
 	flagSet.BoolVar(&showSrc, "src", false, "show source code for symbol")
 	flagSet.BoolVar(&short, "short", false, "one-line representation for each symbol")
 	flagSet.Parse(args)
+	counter.Inc("doc/invocations")
+	counter.CountFlags("doc/flag:", *flag.CommandLine)
+	if chdir != "" {
+		if err := os.Chdir(chdir); err != nil {
+			return err
+		}
+	}
 	var paths []string
 	var symbol, method string
 	// Loop until something is printed.
@@ -135,12 +152,6 @@ func do(writer io.Writer, flagSet *flag.FlagSet, args []string) (err error) {
 			panic(e)
 		}()
 
-		// We have a package.
-		if showAll && symbol == "" {
-			pkg.allDoc()
-			return
-		}
-
 		switch {
 		case symbol == "":
 			pkg.packageDoc() // The package exists, so we got some output.
@@ -149,13 +160,10 @@ func do(writer io.Writer, flagSet *flag.FlagSet, args []string) (err error) {
 			if pkg.symbolDoc(symbol) {
 				return
 			}
-		default:
-			if pkg.methodDoc(symbol, method) {
-				return
-			}
-			if pkg.fieldDoc(symbol, method) {
-				return
-			}
+		case pkg.printMethodDoc(symbol, method):
+			return
+		case pkg.printFieldDoc(symbol, method):
+			return
 		}
 	}
 }

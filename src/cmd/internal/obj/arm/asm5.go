@@ -37,7 +37,7 @@ import (
 	"internal/buildcfg"
 	"log"
 	"math"
-	"sort"
+	"slices"
 )
 
 // ctxt5 holds state while assembling a single function.
@@ -688,13 +688,16 @@ func (c *ctxt5) addpool(p *obj.Prog, a *obj.Addr) {
 			t.Rel = p
 		}
 
-	case C_SROREG,
-		C_LOREG,
-		C_ROREG,
+	case C_HOREG,
 		C_FOREG,
+		C_HFOREG,
 		C_SOREG,
-		C_HOREG,
+		C_ROREG,
+		C_SROREG,
+		C_LOREG,
+		C_HAUTO,
 		C_FAUTO,
+		C_HFAUTO,
 		C_SAUTO,
 		C_LAUTO,
 		C_LACON:
@@ -976,7 +979,7 @@ func (c *ctxt5) aclass(a *obj.Addr) int {
 			if immrot(^uint32(c.instoffset)) != 0 {
 				return C_NCON
 			}
-			if uint32(c.instoffset) <= 0xffff && buildcfg.GOARM == 7 {
+			if uint32(c.instoffset) <= 0xffff && buildcfg.GOARM.Version == 7 {
 				return C_SCON
 			}
 			if x, y := immrot2a(uint32(c.instoffset)); x != 0 && y != 0 {
@@ -1096,6 +1099,32 @@ func (c *ctxt5) oplook(p *obj.Prog) *Optab {
 		fmt.Printf("\t\t%d %d\n", p.From.Type, p.To.Type)
 	}
 
+	if (p.As == ASRL || p.As == ASRA) && p.From.Type == obj.TYPE_CONST && p.From.Offset == 0 {
+		// Right shifts are weird - a shift that looks like "shift by constant 0" actually
+		// means "shift by constant 32". Use left shift in this situation instead.
+		// See issue 64715.
+		// TODO: rotate by 0? Not currently supported, but if we ever do then include it here.
+		p.As = ASLL
+	}
+	if p.As != AMOVB && p.As != AMOVBS && p.As != AMOVBU && p.As != AMOVH && p.As != AMOVHS && p.As != AMOVHU && p.As != AXTAB && p.As != AXTABU && p.As != AXTAH && p.As != AXTAHU {
+		// Same here, but for shifts encoded in Addrs.
+		// Don't do it for the extension ops, which
+		// need to keep their RR shifts.
+		fixShift := func(a *obj.Addr) {
+			if a.Type == obj.TYPE_SHIFT {
+				typ := a.Offset & SHIFT_RR
+				isConst := a.Offset&(1<<4) == 0
+				amount := a.Offset >> 7 & 0x1f
+				if isConst && amount == 0 && (typ == SHIFT_LR || typ == SHIFT_AR || typ == SHIFT_RR) {
+					a.Offset -= typ
+					a.Offset += SHIFT_LL
+				}
+			}
+		}
+		fixShift(&p.From)
+		fixShift(&p.To)
+	}
+
 	ops := oprange[p.As&obj.AMask]
 	c1 := &xcmp[a1]
 	c3 := &xcmp[a3]
@@ -1174,36 +1203,20 @@ func cmp(a int, b int) bool {
 	return false
 }
 
-type ocmp []Optab
-
-func (x ocmp) Len() int {
-	return len(x)
-}
-
-func (x ocmp) Swap(i, j int) {
-	x[i], x[j] = x[j], x[i]
-}
-
-func (x ocmp) Less(i, j int) bool {
-	p1 := &x[i]
-	p2 := &x[j]
-	n := int(p1.as) - int(p2.as)
-	if n != 0 {
-		return n < 0
+func ocmp(a, b Optab) int {
+	if a.as != b.as {
+		return int(a.as) - int(b.as)
 	}
-	n = int(p1.a1) - int(p2.a1)
-	if n != 0 {
-		return n < 0
+	if a.a1 != b.a1 {
+		return int(a.a1) - int(b.a1)
 	}
-	n = int(p1.a2) - int(p2.a2)
-	if n != 0 {
-		return n < 0
+	if a.a2 != b.a2 {
+		return int(a.a2) - int(b.a2)
 	}
-	n = int(p1.a3) - int(p2.a3)
-	if n != 0 {
-		return n < 0
+	if a.a3 != b.a3 {
+		return int(a.a3) - int(b.a3)
 	}
-	return false
+	return 0
 }
 
 func opset(a, b0 obj.As) {
@@ -1242,7 +1255,7 @@ func buildop(ctxt *obj.Link) {
 		}
 	}
 
-	sort.Sort(ocmp(optab[:n]))
+	slices.SortFunc(optab[:n], ocmp)
 	for i := 0; i < n; i++ {
 		r := optab[i].as
 		r0 := r & obj.AMask
@@ -3041,16 +3054,16 @@ func (c *ctxt5) omvl(p *obj.Prog, a *obj.Addr, dr int) uint32 {
 }
 
 func (c *ctxt5) chipzero5(e float64) int {
-	// We use GOARM=7 to gate the use of VFPv3 vmov (imm) instructions.
-	if buildcfg.GOARM < 7 || math.Float64bits(e) != 0 {
+	// We use GOARM.Version=7 and !GOARM.SoftFloat to gate the use of VFPv3 vmov (imm) instructions.
+	if buildcfg.GOARM.Version < 7 || buildcfg.GOARM.SoftFloat || math.Float64bits(e) != 0 {
 		return -1
 	}
 	return 0
 }
 
 func (c *ctxt5) chipfloat5(e float64) int {
-	// We use GOARM=7 to gate the use of VFPv3 vmov (imm) instructions.
-	if buildcfg.GOARM < 7 {
+	// We use GOARM.Version=7 and !GOARM.SoftFloat to gate the use of VFPv3 vmov (imm) instructions.
+	if buildcfg.GOARM.Version < 7 || buildcfg.GOARM.SoftFloat {
 		return -1
 	}
 

@@ -23,47 +23,60 @@ import (
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/fsys"
+	"cmd/go/internal/gover"
 	"cmd/go/internal/lockedfile"
-	"cmd/go/internal/par"
-	"cmd/go/internal/robustio"
+	"cmd/go/internal/str"
 	"cmd/go/internal/trace"
+	"cmd/internal/par"
+	"cmd/internal/robustio"
 
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/sumdb/dirhash"
 	modzip "golang.org/x/mod/zip"
 )
 
-var downloadCache par.Cache
+var downloadCache par.ErrCache[module.Version, string] // version → directory
+
+var ErrToolchain = errors.New("internal error: invalid operation on toolchain module")
 
 // Download downloads the specific module version to the
 // local download cache and returns the name of the directory
 // corresponding to the root of the module's file tree.
 func Download(ctx context.Context, mod module.Version) (dir string, err error) {
-	if err := checkCacheDir(); err != nil {
-		base.Fatalf("go: %v", err)
+	if gover.IsToolchain(mod.Path) {
+		return "", ErrToolchain
+	}
+	if err := checkCacheDir(ctx); err != nil {
+		base.Fatal(err)
 	}
 
 	// The par.Cache here avoids duplicate work.
-	type cached struct {
-		dir string
-		err error
-	}
-	c := downloadCache.Do(mod, func() any {
+	return downloadCache.Do(mod, func() (string, error) {
 		dir, err := download(ctx, mod)
 		if err != nil {
-			return cached{"", err}
+			return "", err
 		}
-		checkMod(mod)
-		return cached{dir, nil}
-	}).(cached)
-	return c.dir, c.err
+		checkMod(ctx, mod)
+
+		// If go.mod exists (not an old legacy module), check version is not too new.
+		if data, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil {
+			goVersion := gover.GoModLookup(data, "go")
+			if gover.Compare(goVersion, gover.Local()) > 0 {
+				return "", &gover.TooNewError{What: mod.String(), GoVersion: goVersion}
+			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+
+		return dir, nil
+	})
 }
 
 func download(ctx context.Context, mod module.Version) (dir string, err error) {
 	ctx, span := trace.StartSpan(ctx, "modfetch.download "+mod.String())
 	defer span.Done()
 
-	dir, err = DownloadDir(mod)
+	dir, err = DownloadDir(ctx, mod)
 	if err == nil {
 		// The directory has already been completely extracted (no .partial file exists).
 		return dir, nil
@@ -79,7 +92,7 @@ func download(ctx context.Context, mod module.Version) (dir string, err error) {
 		return "", err
 	}
 
-	unlock, err := lockVersion(mod)
+	unlock, err := lockVersion(ctx, mod)
 	if err != nil {
 		return "", err
 	}
@@ -89,7 +102,7 @@ func download(ctx context.Context, mod module.Version) (dir string, err error) {
 	defer span.Done()
 
 	// Check whether the directory was populated while we were waiting on the lock.
-	_, dirErr := DownloadDir(mod)
+	_, dirErr := DownloadDir(ctx, mod)
 	if dirErr == nil {
 		return dir, nil
 	}
@@ -102,7 +115,7 @@ func download(ctx context.Context, mod module.Version) (dir string, err error) {
 	// active.
 	parentDir := filepath.Dir(dir)
 	tmpPrefix := filepath.Base(dir) + ".tmp-"
-	if old, err := filepath.Glob(filepath.Join(parentDir, tmpPrefix+"*")); err == nil {
+	if old, err := filepath.Glob(filepath.Join(str.QuoteGlob(parentDir), str.QuoteGlob(tmpPrefix)+"*")); err == nil {
 		for _, path := range old {
 			RemoveAll(path) // best effort
 		}
@@ -113,7 +126,7 @@ func download(ctx context.Context, mod module.Version) (dir string, err error) {
 		}
 	}
 
-	partialPath, err := CachePath(mod, "partial")
+	partialPath, err := CachePath(ctx, mod, "partial")
 	if err != nil {
 		return "", err
 	}
@@ -155,46 +168,52 @@ func download(ctx context.Context, mod module.Version) (dir string, err error) {
 	return dir, nil
 }
 
-var downloadZipCache par.Cache
+var downloadZipCache par.ErrCache[module.Version, string]
 
 // DownloadZip downloads the specific module version to the
 // local zip cache and returns the name of the zip file.
 func DownloadZip(ctx context.Context, mod module.Version) (zipfile string, err error) {
 	// The par.Cache here avoids duplicate work.
-	type cached struct {
-		zipfile string
-		err     error
-	}
-	c := downloadZipCache.Do(mod, func() any {
-		zipfile, err := CachePath(mod, "zip")
+	return downloadZipCache.Do(mod, func() (string, error) {
+		zipfile, err := CachePath(ctx, mod, "zip")
 		if err != nil {
-			return cached{"", err}
+			return "", err
 		}
 		ziphashfile := zipfile + "hash"
 
 		// Return without locking if the zip and ziphash files exist.
 		if _, err := os.Stat(zipfile); err == nil {
 			if _, err := os.Stat(ziphashfile); err == nil {
-				return cached{zipfile, nil}
+				return zipfile, nil
 			}
 		}
 
 		// The zip or ziphash file does not exist. Acquire the lock and create them.
 		if cfg.CmdName != "mod download" {
-			fmt.Fprintf(os.Stderr, "go: downloading %s %s\n", mod.Path, mod.Version)
+			vers := mod.Version
+			if mod.Path == "golang.org/toolchain" {
+				// Shorten v0.0.1-go1.13.1.darwin-amd64 to go1.13.1.darwin-amd64
+				_, vers, _ = strings.Cut(vers, "-")
+				if i := strings.LastIndex(vers, "."); i >= 0 {
+					goos, goarch, _ := strings.Cut(vers[i+1:], "-")
+					vers = vers[:i] + " (" + goos + "/" + goarch + ")"
+				}
+				fmt.Fprintf(os.Stderr, "go: downloading %s\n", vers)
+			} else {
+				fmt.Fprintf(os.Stderr, "go: downloading %s %s\n", mod.Path, vers)
+			}
 		}
-		unlock, err := lockVersion(mod)
+		unlock, err := lockVersion(ctx, mod)
 		if err != nil {
-			return cached{"", err}
+			return "", err
 		}
 		defer unlock()
 
 		if err := downloadZip(ctx, mod, zipfile); err != nil {
-			return cached{"", err}
+			return "", err
 		}
-		return cached{zipfile, nil}
-	}).(cached)
-	return c.zipfile, c.err
+		return zipfile, nil
+	})
 }
 
 func downloadZip(ctx context.Context, mod module.Version, zipfile string) (err error) {
@@ -224,7 +243,7 @@ func downloadZip(ctx context.Context, mod module.Version, zipfile string) (err e
 	// This is only safe to do because the lock file ensures that their
 	// writers are no longer active.
 	tmpPattern := filepath.Base(zipfile) + "*.tmp"
-	if old, err := filepath.Glob(filepath.Join(filepath.Dir(zipfile), tmpPattern)); err == nil {
+	if old, err := filepath.Glob(filepath.Join(str.QuoteGlob(filepath.Dir(zipfile)), tmpPattern)); err == nil {
 		for _, path := range old {
 			os.Remove(path) // best effort
 		}
@@ -241,7 +260,7 @@ func downloadZip(ctx context.Context, mod module.Version, zipfile string) (err e
 	// contents of the file (by hashing it) before we commit it. Because the file
 	// is zip-compressed, we need an actual file — or at least an io.ReaderAt — to
 	// validate it: we can't just tee the stream as we write it.
-	f, err := os.CreateTemp(filepath.Dir(zipfile), tmpPattern)
+	f, err := tempFile(ctx, filepath.Dir(zipfile), filepath.Base(zipfile), 0666)
 	if err != nil {
 		return err
 	}
@@ -257,8 +276,8 @@ func downloadZip(ctx context.Context, mod module.Version, zipfile string) (err e
 		if unrecoverableErr != nil {
 			return unrecoverableErr
 		}
-		repo := Lookup(proxy, mod.Path)
-		err := repo.Zip(f, mod.Version)
+		repo := Lookup(ctx, proxy, mod.Path)
+		err := repo.Zip(ctx, f, mod.Version)
 		if err != nil {
 			// Zip may have partially written to f before failing.
 			// (Perhaps the server crashed while sending the file?)
@@ -319,7 +338,7 @@ func downloadZip(ctx context.Context, mod module.Version, zipfile string) (err e
 //
 // If the hash does not match go.sum (or the sumdb if enabled), hashZip returns
 // an error and does not write ziphashfile.
-func hashZip(mod module.Version, zipfile, ziphashfile string) error {
+func hashZip(mod module.Version, zipfile, ziphashfile string) (err error) {
 	hash, err := dirhash.HashZip(zipfile, dirhash.DefaultHash)
 	if err != nil {
 		return err
@@ -331,16 +350,17 @@ func hashZip(mod module.Version, zipfile, ziphashfile string) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if closeErr := hf.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
 	if err := hf.Truncate(int64(len(hash))); err != nil {
 		return err
 	}
 	if _, err := hf.WriteAt([]byte(hash), 0); err != nil {
 		return err
 	}
-	if err := hf.Close(); err != nil {
-		return err
-	}
-
 	return nil
 }
 
@@ -405,6 +425,28 @@ type modSumStatus struct {
 	used, dirty bool
 }
 
+// Reset resets globals in the modfetch package, so previous loads don't affect
+// contents of go.sum files.
+func Reset() {
+	GoSumFile = ""
+	WorkspaceGoSumFiles = nil
+
+	// Uses of lookupCache and downloadCache both can call checkModSum,
+	// which in turn sets the used bit on goSum.status for modules.
+	// Reset them so used can be computed properly.
+	lookupCache = par.Cache[lookupCacheKey, Repo]{}
+	downloadCache = par.ErrCache[module.Version, string]{}
+
+	// Clear all fields on goSum. It will be initialized later
+	goSum.mu.Lock()
+	goSum.m = nil
+	goSum.w = nil
+	goSum.status = nil
+	goSum.overwrite = false
+	goSum.enabled = false
+	goSum.mu.Unlock()
+}
+
 // initGoSum initializes the go.sum data.
 // The boolean it returns reports whether the
 // use of go.sum is now enabled.
@@ -462,7 +504,7 @@ const emptyGoModHash = "h1:G7mAYYxgmS0lVkHyy2hEOLQCFB0DlQFTMLWggykrydY="
 
 // readGoSum parses data, which is the content of file,
 // and adds it to goSum.m. The goSum lock must be held.
-func readGoSum(dst map[module.Version][]string, file string, data []byte) error {
+func readGoSum(dst map[module.Version][]string, file string, data []byte) {
 	lineno := 0
 	for len(data) > 0 {
 		var line []byte
@@ -479,7 +521,12 @@ func readGoSum(dst map[module.Version][]string, file string, data []byte) error 
 			continue
 		}
 		if len(f) != 3 {
-			return fmt.Errorf("malformed go.sum:\n%s:%d: wrong number of fields %v", file, lineno, len(f))
+			if cfg.CmdName == "mod tidy" {
+				// ignore malformed line so that go mod tidy can fix go.sum
+				continue
+			} else {
+				base.Fatalf("malformed go.sum:\n%s:%d: wrong number of fields %v\n", file, lineno, len(f))
+			}
 		}
 		if f[2] == emptyGoModHash {
 			// Old bug; drop it.
@@ -488,7 +535,6 @@ func readGoSum(dst map[module.Version][]string, file string, data []byte) error 
 		mod := module.Version{Path: f[0], Version: f[1]}
 		dst[mod] = append(dst[mod], f[2])
 	}
-	return nil
 }
 
 // HaveSum returns true if the go.sum file contains an entry for mod.
@@ -523,10 +569,51 @@ func HaveSum(mod module.Version) bool {
 	return false
 }
 
-// checkMod checks the given module's checksum.
-func checkMod(mod module.Version) {
+// RecordedSum returns the sum if the go.sum file contains an entry for mod.
+// The boolean reports true if an entry was found or
+// false if no entry found or two conflicting sums are found.
+// The entry's hash must be generated with a known hash algorithm.
+// mod.Version may have a "/go.mod" suffix to distinguish sums for
+// .mod and .zip files.
+func RecordedSum(mod module.Version) (sum string, ok bool) {
+	goSum.mu.Lock()
+	defer goSum.mu.Unlock()
+	inited, err := initGoSum()
+	foundSum := ""
+	if err != nil || !inited {
+		return "", false
+	}
+	for _, goSums := range goSum.w {
+		for _, h := range goSums[mod] {
+			if !strings.HasPrefix(h, "h1:") {
+				continue
+			}
+			if !goSum.status[modSum{mod, h}].dirty {
+				if foundSum != "" && foundSum != h { // conflicting sums exist
+					return "", false
+				}
+				foundSum = h
+			}
+		}
+	}
+	for _, h := range goSum.m[mod] {
+		if !strings.HasPrefix(h, "h1:") {
+			continue
+		}
+		if !goSum.status[modSum{mod, h}].dirty {
+			if foundSum != "" && foundSum != h { // conflicting sums exist
+				return "", false
+			}
+			foundSum = h
+		}
+	}
+	return foundSum, true
+}
+
+// checkMod checks the given module's checksum and Go version.
+func checkMod(ctx context.Context, mod module.Version) {
 	// Do the file I/O before acquiring the go.sum lock.
-	ziphash, err := CachePath(mod, "ziphash")
+	ziphash, err := CachePath(ctx, mod, "ziphash")
 	if err != nil {
 		base.Fatalf("verifying %v", module.VersionError(mod, err))
 	}
@@ -537,7 +624,7 @@ func checkMod(mod module.Version) {
 	data = bytes.TrimSpace(data)
 	if !isValidSum(data) {
 		// Recreate ziphash file from zip file and use that to check the mod sum.
-		zip, err := CachePath(mod, "zip")
+		zip, err := CachePath(ctx, mod, "zip")
 		if err != nil {
 			base.Fatalf("verifying %v", module.VersionError(mod, err))
 		}
@@ -674,9 +761,9 @@ func addModSumLocked(mod module.Version, h string) {
 func checkSumDB(mod module.Version, h string) error {
 	modWithoutSuffix := mod
 	noun := "module"
-	if strings.HasSuffix(mod.Version, "/go.mod") {
+	if before, found := strings.CutSuffix(mod.Version, "/go.mod"); found {
 		noun = "go.mod"
-		modWithoutSuffix.Version = strings.TrimSuffix(mod.Version, "/go.mod")
+		modWithoutSuffix.Version = before
 	}
 
 	db, lines, err := lookupSumDB(mod)
@@ -699,13 +786,13 @@ func checkSumDB(mod module.Version, h string) error {
 
 // Sum returns the checksum for the downloaded copy of the given module,
 // if present in the download cache.
-func Sum(mod module.Version) string {
+func Sum(ctx context.Context, mod module.Version) string {
 	if cfg.GOMODCACHE == "" {
 		// Do not use current directory.
 		return ""
 	}
 
-	ziphash, err := CachePath(mod, "ziphash")
+	ziphash, err := CachePath(ctx, mod, "ziphash")
 	if err != nil {
 		return ""
 	}
@@ -745,7 +832,7 @@ var ErrGoSumDirty = errors.New("updates to go.sum needed, disabled by -mod=reado
 // It should have entries for both module content sums and go.mod sums
 // (version ends with "/go.mod"). Existing sums will be preserved unless they
 // have been marked for deletion with TrimGoSum.
-func WriteGoSum(keep map[module.Version]bool, readonly bool) error {
+func WriteGoSum(ctx context.Context, keep map[module.Version]bool, readonly bool) error {
 	goSum.mu.Lock()
 	defer goSum.mu.Unlock()
 
@@ -780,43 +867,13 @@ Outer:
 
 	// Make a best-effort attempt to acquire the side lock, only to exclude
 	// previous versions of the 'go' command from making simultaneous edits.
-	if unlock, err := SideLock(); err == nil {
+	if unlock, err := SideLock(ctx); err == nil {
 		defer unlock()
 	}
 
 	err := lockedfile.Transform(GoSumFile, func(data []byte) ([]byte, error) {
-		if !goSum.overwrite {
-			// Incorporate any sums added by other processes in the meantime.
-			// Add only the sums that we actually checked: the user may have edited or
-			// truncated the file to remove erroneous hashes, and we shouldn't restore
-			// them without good reason.
-			goSum.m = make(map[module.Version][]string, len(goSum.m))
-			readGoSum(goSum.m, GoSumFile, data)
-			for ms, st := range goSum.status {
-				if st.used && !sumInWorkspaceModulesLocked(ms.mod) {
-					addModSumLocked(ms.mod, ms.sum)
-				}
-			}
-		}
-
-		var mods []module.Version
-		for m := range goSum.m {
-			mods = append(mods, m)
-		}
-		module.Sort(mods)
-
-		var buf bytes.Buffer
-		for _, m := range mods {
-			list := goSum.m[m]
-			sort.Strings(list)
-			for _, h := range list {
-				st := goSum.status[modSum{m, h}]
-				if (!st.dirty || (st.used && keep[m])) && !sumInWorkspaceModulesLocked(m) {
-					fmt.Fprintf(&buf, "%s %s %s\n", m.Path, m.Version, h)
-				}
-			}
-		}
-		return buf.Bytes(), nil
+		tidyGoSum := tidyGoSum(data, keep)
+		return tidyGoSum, nil
 	})
 
 	if err != nil {
@@ -826,6 +883,57 @@ Outer:
 	goSum.status = make(map[modSum]modSumStatus)
 	goSum.overwrite = false
 	return nil
+}
+
+// TidyGoSum returns a tidy version of the go.sum file.
+// A missing go.sum file is treated as if empty.
+func TidyGoSum(keep map[module.Version]bool) (before, after []byte) {
+	goSum.mu.Lock()
+	defer goSum.mu.Unlock()
+	before, err := lockedfile.Read(GoSumFile)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		base.Fatalf("reading go.sum: %v", err)
+	}
+	after = tidyGoSum(before, keep)
+	return before, after
+}
+
+// tidyGoSum returns a tidy version of the go.sum file.
+// The goSum lock must be held.
+func tidyGoSum(data []byte, keep map[module.Version]bool) []byte {
+	if !goSum.overwrite {
+		// Incorporate any sums added by other processes in the meantime.
+		// Add only the sums that we actually checked: the user may have edited or
+		// truncated the file to remove erroneous hashes, and we shouldn't restore
+		// them without good reason.
+		goSum.m = make(map[module.Version][]string, len(goSum.m))
+		readGoSum(goSum.m, GoSumFile, data)
+		for ms, st := range goSum.status {
+			if st.used && !sumInWorkspaceModulesLocked(ms.mod) {
+				addModSumLocked(ms.mod, ms.sum)
+			}
+		}
+	}
+
+	var mods []module.Version
+	for m := range goSum.m {
+		mods = append(mods, m)
+	}
+	module.Sort(mods)
+
+	var buf bytes.Buffer
+	for _, m := range mods {
+		list := goSum.m[m]
+		sort.Strings(list)
+		str.Uniq(&list)
+		for _, h := range list {
+			st := goSum.status[modSum{m, h}]
+			if (!st.dirty || (st.used && keep[m])) && !sumInWorkspaceModulesLocked(m) {
+				fmt.Fprintf(&buf, "%s %s %s\n", m.Path, m.Version, h)
+			}
+		}
+	}
+	return buf.Bytes()
 }
 
 func sumInWorkspaceModulesLocked(m module.Version) bool {

@@ -35,6 +35,9 @@ func Exit(code int) {
 func Exitf(format string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, os.Args[0]+": "+format+"\n", a...)
 	nerrors++
+	if *flagH {
+		panic("error")
+	}
 	Exit(2)
 }
 
@@ -101,14 +104,4 @@ func stringtouint32(x []uint32, s string) {
 		s = s[copy(buf[:], s):]
 		x[i] = binary.LittleEndian.Uint32(buf[:])
 	}
-}
-
-// contains reports whether v is in s.
-func contains(s []string, v string) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }

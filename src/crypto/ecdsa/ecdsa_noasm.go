@@ -2,20 +2,16 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !s390x
+//go:build !s390x || purego
 
 package ecdsa
 
-import (
-	"crypto/cipher"
-	"crypto/elliptic"
-	"math/big"
-)
+import "io"
 
-func sign(priv *PrivateKey, csprng *cipher.StreamReader, c elliptic.Curve, hash []byte) (r, s *big.Int, err error) {
-	return signGeneric(priv, csprng, c, hash)
+func verifyAsm(pub *PublicKey, hash []byte, sig []byte) error {
+	return errNoAsm
 }
 
-func verify(pub *PublicKey, c elliptic.Curve, hash []byte, r, s *big.Int) bool {
-	return verifyGeneric(pub, c, hash, r, s)
+func signAsm(priv *PrivateKey, csprng io.Reader, hash []byte) (sig []byte, err error) {
+	return nil, errNoAsm
 }

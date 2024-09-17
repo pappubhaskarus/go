@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !purego
+
 #include "textflag.h"
 
 #define B0 V0
@@ -164,7 +166,7 @@ initEncFinish:
 	AESE	T0.B16, B0.B16
 	AESMC	B0.B16, B0.B16
 	AESE	T1.B16, B0.B16
- 	VEOR	T2.B16, B0.B16, B0.B16
+	VEOR	T2.B16, B0.B16, B0.B16
 
 	VREV64	B0.B16, B0.B16
 

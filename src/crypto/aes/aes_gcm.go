@@ -2,13 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build amd64 || arm64
+//go:build (amd64 || arm64) && !purego
 
 package aes
 
 import (
 	"crypto/cipher"
-	subtleoverlap "crypto/internal/subtle"
+	"crypto/internal/alias"
 	"crypto/subtle"
 	"errors"
 )
@@ -39,20 +39,13 @@ const (
 
 var errOpen = errors.New("cipher: message authentication failed")
 
-// aesCipherGCM implements crypto/cipher.gcmAble so that crypto/cipher.NewGCM
-// will use the optimised implementation in this file when possible. Instances
-// of this type only exist when hasGCMAsm returns true.
-type aesCipherGCM struct {
-	aesCipherAsm
-}
-
 // Assert that aesCipherGCM implements the gcmAble interface.
 var _ gcmAble = (*aesCipherGCM)(nil)
 
 // NewGCM returns the AES cipher wrapped in Galois Counter Mode. This is only
-// called by crypto/cipher.NewGCM via the gcmAble interface.
+// called by [crypto/cipher.NewGCM] via the gcmAble interface.
 func (c *aesCipherGCM) NewGCM(nonceSize, tagSize int) (cipher.AEAD, error) {
-	g := &gcmAsm{ks: c.enc, nonceSize: nonceSize, tagSize: tagSize}
+	g := &gcmAsm{ks: c.enc[:c.l], nonceSize: nonceSize, tagSize: tagSize}
 	gcmAesInit(&g.productTable, g.ks)
 	return g, nil
 }
@@ -93,7 +86,7 @@ func sliceForAppend(in []byte, n int) (head, tail []byte) {
 	return
 }
 
-// Seal encrypts and authenticates plaintext. See the cipher.AEAD interface for
+// Seal encrypts and authenticates plaintext. See the [cipher.AEAD] interface for
 // details.
 func (g *gcmAsm) Seal(dst, nonce, plaintext, data []byte) []byte {
 	if len(nonce) != g.nonceSize {
@@ -121,7 +114,7 @@ func (g *gcmAsm) Seal(dst, nonce, plaintext, data []byte) []byte {
 	gcmAesData(&g.productTable, data, &tagOut)
 
 	ret, out := sliceForAppend(dst, len(plaintext)+g.tagSize)
-	if subtleoverlap.InexactOverlap(out[:len(plaintext)], plaintext) {
+	if alias.InexactOverlap(out[:len(plaintext)], plaintext) {
 		panic("crypto/cipher: invalid buffer overlap")
 	}
 	if len(plaintext) > 0 {
@@ -133,7 +126,7 @@ func (g *gcmAsm) Seal(dst, nonce, plaintext, data []byte) []byte {
 	return ret
 }
 
-// Open authenticates and decrypts ciphertext. See the cipher.AEAD interface
+// Open authenticates and decrypts ciphertext. See the [cipher.AEAD] interface
 // for details.
 func (g *gcmAsm) Open(dst, nonce, ciphertext, data []byte) ([]byte, error) {
 	if len(nonce) != g.nonceSize {
@@ -174,7 +167,7 @@ func (g *gcmAsm) Open(dst, nonce, ciphertext, data []byte) ([]byte, error) {
 	gcmAesData(&g.productTable, data, &expectedTag)
 
 	ret, out := sliceForAppend(dst, len(ciphertext))
-	if subtleoverlap.InexactOverlap(out, ciphertext) {
+	if alias.InexactOverlap(out, ciphertext) {
 		panic("crypto/cipher: invalid buffer overlap")
 	}
 	if len(ciphertext) > 0 {
@@ -183,9 +176,7 @@ func (g *gcmAsm) Open(dst, nonce, ciphertext, data []byte) ([]byte, error) {
 	gcmAesFinish(&g.productTable, &tagMask, &expectedTag, uint64(len(ciphertext)), uint64(len(data)))
 
 	if subtle.ConstantTimeCompare(expectedTag[:g.tagSize], tag) != 1 {
-		for i := range out {
-			out[i] = 0
-		}
+		clear(out)
 		return nil, errOpen
 	}
 

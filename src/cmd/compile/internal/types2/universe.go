@@ -23,7 +23,8 @@ var (
 	universeIota       Object
 	universeByte       Type // uint8 alias, but has name "byte"
 	universeRune       Type // int32 alias, but has name "rune"
-	universeAny        Object
+	universeAnyNoAlias *TypeName
+	universeAnyAlias   *TypeName
 	universeError      Type
 	universeComparable Object
 )
@@ -65,7 +66,7 @@ var Typ = [...]*Basic{
 	UntypedNil:     {UntypedNil, IsUntyped, "untyped nil"},
 }
 
-var aliases = [...]*Basic{
+var basicAliases = [...]*Basic{
 	{Byte, IsInteger | IsUnsigned, "byte"},
 	{Rune, IsInteger, "rune"},
 }
@@ -74,36 +75,72 @@ func defPredeclaredTypes() {
 	for _, t := range Typ {
 		def(NewTypeName(nopos, nil, t.name, t))
 	}
-	for _, t := range aliases {
+	for _, t := range basicAliases {
 		def(NewTypeName(nopos, nil, t.name, t))
 	}
 
 	// type any = interface{}
-	// Note: don't use &emptyInterface for the type of any. Using a unique
-	// pointer allows us to detect any and format it as "any" rather than
-	// interface{}, which clarifies user-facing error messages significantly.
-	def(NewTypeName(nopos, nil, "any", &Interface{complete: true, tset: &topTypeSet}))
+	//
+	// Implement two representations of any: one for the legacy gotypesalias=0,
+	// and one for gotypesalias=1. This is necessary for consistent
+	// representation of interface aliases during type checking, and is
+	// implemented via hijacking [Scope.Lookup] for the [Universe] scope.
+	//
+	// Both representations use the same distinguished pointer for their RHS
+	// interface type, allowing us to detect any (even with the legacy
+	// representation), and format it as "any" rather than interface{}, which
+	// clarifies user-facing error messages significantly.
+	//
+	// TODO(rfindley): once the gotypesalias GODEBUG variable is obsolete (and we
+	// consistently use the Alias node), we should be able to clarify user facing
+	// error messages without using a distinguished pointer for the any
+	// interface.
+	{
+		universeAnyNoAlias = NewTypeName(nopos, nil, "any", &Interface{complete: true, tset: &topTypeSet})
+		universeAnyNoAlias.setColor(black)
+		// ensure that the any TypeName reports a consistent Parent, after
+		// hijacking Universe.Lookup with gotypesalias=0.
+		universeAnyNoAlias.setParent(Universe)
+
+		// It shouldn't matter which representation of any is actually inserted
+		// into the Universe, but we lean toward the future and insert the Alias
+		// representation.
+		universeAnyAlias = NewTypeName(nopos, nil, "any", nil)
+		universeAnyAlias.setColor(black)
+		_ = NewAlias(universeAnyAlias, universeAnyNoAlias.Type().Underlying()) // Link TypeName and Alias
+		def(universeAnyAlias)
+	}
 
 	// type error interface{ Error() string }
 	{
 		obj := NewTypeName(nopos, nil, "error", nil)
 		obj.setColor(black)
+		typ := NewNamed(obj, nil, nil)
+
+		// error.Error() string
+		recv := NewVar(nopos, nil, "", typ)
 		res := NewVar(nopos, nil, "", Typ[String])
-		sig := NewSignatureType(nil, nil, nil, nil, NewTuple(res), false)
+		sig := NewSignatureType(recv, nil, nil, nil, NewTuple(res), false)
 		err := NewFunc(nopos, nil, "Error", sig)
-		ityp := &Interface{nil, obj, []*Func{err}, nil, nil, false, true, nil}
+
+		// interface{ Error() string }
+		ityp := &Interface{methods: []*Func{err}, complete: true}
 		computeInterfaceTypeSet(nil, nopos, ityp) // prevent races due to lazy computation of tset
-		typ := NewNamed(obj, ityp, nil)
-		sig.recv = NewVar(nopos, nil, "", typ)
+
+		typ.SetUnderlying(ityp)
 		def(obj)
 	}
 
-	// type comparable interface{ /* type set marked comparable */ }
+	// type comparable interface{} // marked as comparable
 	{
 		obj := NewTypeName(nopos, nil, "comparable", nil)
 		obj.setColor(black)
-		ityp := &Interface{nil, obj, nil, nil, nil, false, true, &_TypeSet{true, nil, allTermlist}}
-		NewNamed(obj, ityp, nil)
+		typ := NewNamed(obj, nil, nil)
+
+		// interface{} // marked as comparable
+		ityp := &Interface{complete: true, tset: &_TypeSet{nil, allTermlist, true}}
+
+		typ.SetUnderlying(ityp)
 		def(obj)
 	}
 }
@@ -135,6 +172,7 @@ const (
 	// universe scope
 	_Append builtinId = iota
 	_Cap
+	_Clear
 	_Close
 	_Complex
 	_Copy
@@ -142,6 +180,8 @@ const (
 	_Imag
 	_Len
 	_Make
+	_Max
+	_Min
 	_New
 	_Panic
 	_Print
@@ -155,6 +195,9 @@ const (
 	_Offsetof
 	_Sizeof
 	_Slice
+	_SliceData
+	_String
+	_StringData
 
 	// testing support
 	_Assert
@@ -169,6 +212,7 @@ var predeclaredFuncs = [...]struct {
 }{
 	_Append:  {"append", 1, true, expression},
 	_Cap:     {"cap", 1, false, expression},
+	_Clear:   {"clear", 1, false, statement},
 	_Close:   {"close", 1, false, statement},
 	_Complex: {"complex", 2, false, expression},
 	_Copy:    {"copy", 2, false, statement},
@@ -176,6 +220,9 @@ var predeclaredFuncs = [...]struct {
 	_Imag:    {"imag", 1, false, expression},
 	_Len:     {"len", 1, false, expression},
 	_Make:    {"make", 1, true, expression},
+	// To disable max/min, remove the next two lines.
+	_Max:     {"max", 1, true, expression},
+	_Min:     {"min", 1, true, expression},
 	_New:     {"new", 1, false, expression},
 	_Panic:   {"panic", 1, false, statement},
 	_Print:   {"print", 0, true, statement},
@@ -183,11 +230,14 @@ var predeclaredFuncs = [...]struct {
 	_Real:    {"real", 1, false, expression},
 	_Recover: {"recover", 0, false, statement},
 
-	_Add:      {"Add", 2, false, expression},
-	_Alignof:  {"Alignof", 1, false, expression},
-	_Offsetof: {"Offsetof", 1, false, expression},
-	_Sizeof:   {"Sizeof", 1, false, expression},
-	_Slice:    {"Slice", 2, false, expression},
+	_Add:        {"Add", 2, false, expression},
+	_Alignof:    {"Alignof", 1, false, expression},
+	_Offsetof:   {"Offsetof", 1, false, expression},
+	_Sizeof:     {"Sizeof", 1, false, expression},
+	_Slice:      {"Slice", 2, false, expression},
+	_SliceData:  {"SliceData", 1, false, expression},
+	_String:     {"String", 2, false, expression},
+	_StringData: {"StringData", 1, false, expression},
 
 	_Assert: {"assert", 1, false, statement},
 	_Trace:  {"trace", 0, true, statement},
@@ -227,7 +277,6 @@ func init() {
 	universeIota = Universe.Lookup("iota")
 	universeByte = Universe.Lookup("byte").Type()
 	universeRune = Universe.Lookup("rune").Type()
-	universeAny = Universe.Lookup("any")
 	universeError = Universe.Lookup("error").Type()
 	universeComparable = Universe.Lookup("comparable")
 }
@@ -235,7 +284,6 @@ func init() {
 // Objects with names containing blanks are internal and not entered into
 // a scope. Objects with exported names are inserted in the unsafe package
 // scope; other objects are inserted in the universe scope.
-//
 func def(obj Object) {
 	assert(obj.color() == black)
 	name := obj.Name()
@@ -243,7 +291,7 @@ func def(obj Object) {
 		return // nothing to do
 	}
 	// fix Obj link for named types
-	if typ, _ := obj.Type().(*Named); typ != nil {
+	if typ := asNamed(obj.Type()); typ != nil {
 		typ.obj = obj.(*TypeName)
 	}
 	// exported identifiers go into package unsafe
@@ -257,7 +305,7 @@ func def(obj Object) {
 		case *Builtin:
 			obj.pkg = Unsafe
 		default:
-			unreachable()
+			panic("unreachable")
 		}
 	}
 	if scope.Insert(obj) != nil {

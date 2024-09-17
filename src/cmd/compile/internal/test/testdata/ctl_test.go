@@ -70,7 +70,6 @@ func switch_ssa(a int) int {
 		ret += 1
 	}
 	return ret
-
 }
 
 func fallthrough_ssa(a int) int {
@@ -92,7 +91,6 @@ func fallthrough_ssa(a int) int {
 		ret++
 	}
 	return ret
-
 }
 
 func testFallthrough(t *testing.T) {
@@ -117,6 +115,7 @@ type junk struct {
 
 // flagOverwrite_ssa is intended to reproduce an issue seen where a XOR
 // was scheduled between a compare and branch, clearing flags.
+//
 //go:noinline
 func flagOverwrite_ssa(s *junk, c int) int {
 	if '0' <= c && c <= '9' {

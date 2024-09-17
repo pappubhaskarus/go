@@ -1,4 +1,4 @@
-// run -gcflags=-G=3
+// run
 
 // Copyright 2021 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
@@ -14,7 +14,7 @@ import (
 	"strconv"
 )
 
-// Element is an element of a linked list.
+// _Element is an element of a linked list.
 type _Element[T any] struct {
 	// Next and previous pointers in the doubly-linked list of elements.
 	// To simplify the implementation, internally a list l is implemented

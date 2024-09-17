@@ -28,7 +28,12 @@
 
 package riscv
 
-import "cmd/internal/obj"
+import (
+	"errors"
+	"fmt"
+
+	"cmd/internal/obj"
+)
 
 //go:generate go run ../stringer.go -i $GOFILE -o anames.go -p riscv
 
@@ -125,13 +130,13 @@ const (
 	REG_A7   = REG_X17
 	REG_S2   = REG_X18
 	REG_S3   = REG_X19
-	REG_S4   = REG_X20 // aka REG_CTXT
+	REG_S4   = REG_X20
 	REG_S5   = REG_X21
 	REG_S6   = REG_X22
 	REG_S7   = REG_X23
 	REG_S8   = REG_X24
 	REG_S9   = REG_X25
-	REG_S10  = REG_X26
+	REG_S10  = REG_X26 // aka REG_CTXT
 	REG_S11  = REG_X27 // aka REG_G
 	REG_T3   = REG_X28
 	REG_T4   = REG_X29
@@ -139,8 +144,8 @@ const (
 	REG_T6   = REG_X31 // aka REG_TMP
 
 	// Go runtime register names.
+	REG_CTXT = REG_S10 // Context for closures.
 	REG_G    = REG_S11 // G pointer.
-	REG_CTXT = REG_S4  // Context for closures.
 	REG_LR   = REG_RA  // Link register.
 	REG_TMP  = REG_T6  // Reserved for assembler use.
 
@@ -260,8 +265,13 @@ const (
 	// corresponding *obj.Prog uses the temporary register.
 	USES_REG_TMP = 1 << iota
 
-	// NEED_CALL_RELOC is set on JAL instructions to indicate that a
-	// R_RISCV_CALL relocation is needed.
+	// NEED_JAL_RELOC is set on JAL instructions to indicate that a
+	// R_RISCV_JAL relocation is needed.
+	NEED_JAL_RELOC
+
+	// NEED_CALL_RELOC is set on an AUIPC instruction to indicate that it
+	// is the first instruction in an AUIPC + JAL pair that needs a
+	// R_RISCV_CALL relocation.
 	NEED_CALL_RELOC
 
 	// NEED_PCREL_ITYPE_RELOC is set on AUIPC instructions to indicate that
@@ -276,15 +286,11 @@ const (
 )
 
 // RISC-V mnemonics, as defined in the "opcodes" and "opcodes-pseudo" files
-// from:
-//
-//    https://github.com/riscv/riscv-opcodes
+// at https://github.com/riscv/riscv-opcodes.
 //
 // As well as some pseudo-mnemonics (e.g. MOV) used only in the assembler.
 //
-// See also "The RISC-V Instruction Set Manual" at:
-//
-//    https://riscv.org/specifications/
+// See also "The RISC-V Instruction Set Manual" at https://riscv.org/specifications/.
 //
 // If you modify this table, you MUST run 'go generate' to regenerate anames.go!
 const (
@@ -313,12 +319,6 @@ const (
 	ASUB
 	ASRA
 
-	// The SLL/SRL/SRA instructions differ slightly between RV32 and RV64,
-	// hence there are pseudo-opcodes for the RV32 specific versions.
-	ASLLIRV32
-	ASRLIRV32
-	ASRAIRV32
-
 	// 2.5: Control Transfer Instructions
 	AJAL
 	AJALR
@@ -342,8 +342,8 @@ const (
 
 	// 2.7: Memory Ordering Instructions
 	AFENCE
-	AFENCEI
 	AFENCETSO
+	APAUSE
 
 	// 5.2: Integer Computational Instructions (RV64I)
 	AADDIW
@@ -536,8 +536,6 @@ const (
 	AFSGNJQ
 	AFSGNJNQ
 	AFSGNJXQ
-	AFMVXQ
-	AFMVQX
 
 	// 13.4 Quad-Precision Floating-Point Compare Instructions
 	AFEQQ
@@ -566,7 +564,6 @@ const (
 	// 3.2.2: Trap-Return Instructions
 	AMRET
 	ASRET
-	AURET
 	ADRET
 
 	// 3.2.3: Wait for Interrupt
@@ -575,9 +572,57 @@ const (
 	// 4.2.1: Supervisor Memory-Management Fence Instruction
 	ASFENCEVMA
 
-	// Hypervisor Memory-Management Instructions
-	AHFENCEGVMA
-	AHFENCEVVMA
+	//
+	// RISC-V Bit-Manipulation ISA-extensions (1.0)
+	//
+
+	// 1.1: Address Generation Instructions (Zba)
+	AADDUW
+	ASH1ADD
+	ASH1ADDUW
+	ASH2ADD
+	ASH2ADDUW
+	ASH3ADD
+	ASH3ADDUW
+	ASLLIUW
+
+	// 1.2: Basic Bit Manipulation (Zbb)
+	AANDN
+	AORN
+	AXNOR
+	ACLZ
+	ACLZW
+	ACTZ
+	ACTZW
+	ACPOP
+	ACPOPW
+	AMAX
+	AMAXU
+	AMIN
+	AMINU
+	ASEXTB
+	ASEXTH
+	AZEXTH
+
+	// 1.3: Bitwise Rotation (Zbb)
+	AROL
+	AROLW
+	AROR
+	ARORI
+	ARORIW
+	ARORW
+	AORCB
+	AREV8
+
+	// 1.5: Single-bit Instructions (Zbs)
+	ABCLR
+	ABCLRI
+	ABEXT
+	ABEXTI
+	ABINV
+	ABINVI
+	ABSET
+	ABSETI
 
 	// The escape hatch. Inserts a single 32-bit word.
 	AWORD
@@ -619,6 +664,50 @@ const (
 	ALAST
 )
 
+// opSuffix encoding to uint8 which fit into p.Scond
+var rmSuffixSet = map[string]uint8{
+	"RNE": RM_RNE,
+	"RTZ": RM_RTZ,
+	"RDN": RM_RDN,
+	"RUP": RM_RUP,
+	"RMM": RM_RMM,
+}
+
+const rmSuffixBit uint8 = 1 << 7
+
+func rmSuffixEncode(s string) (uint8, error) {
+	if s == "" {
+		return 0, errors.New("empty suffix")
+	}
+	enc, ok := rmSuffixSet[s]
+	if !ok {
+		return 0, fmt.Errorf("invalid encoding for unknown suffix:%q", s)
+	}
+	return enc | rmSuffixBit, nil
+}
+
+func rmSuffixString(u uint8) (string, error) {
+	if u&rmSuffixBit == 0 {
+		return "", fmt.Errorf("invalid suffix, require round mode bit:%x", u)
+	}
+
+	u &^= rmSuffixBit
+	for k, v := range rmSuffixSet {
+		if v == u {
+			return k, nil
+		}
+	}
+	return "", fmt.Errorf("unknown suffix:%x", u)
+}
+
+const (
+	RM_RNE uint8 = iota // Round to Nearest, ties to Even
+	RM_RTZ              // Round towards Zero
+	RM_RDN              // Round Down
+	RM_RUP              // Round Up
+	RM_RMM              // Round to Nearest, ties to Max Magnitude
+)
+
 // All unary instructions which write to their arguments (as opposed to reading
 // from them) go here. The assembly parser uses this information to populate
 // its AST in a semantically reasonable way.
@@ -636,13 +725,25 @@ var unaryDst = map[obj.As]bool{
 
 // Instruction encoding masks.
 const (
-	// JTypeImmMask is a mask including only the immediate portion of
-	// J-type instructions.
-	JTypeImmMask = 0xfffff000
+	// BTypeImmMask is a mask including only the immediate portion of
+	// B-type instructions.
+	BTypeImmMask = 0xfe000f80
+
+	// CBTypeImmMask is a mask including only the immediate portion of
+	// CB-type instructions.
+	CBTypeImmMask = 0x1c7c
+
+	// CJTypeImmMask is a mask including only the immediate portion of
+	// CJ-type instructions.
+	CJTypeImmMask = 0x1f7c
 
 	// ITypeImmMask is a mask including only the immediate portion of
 	// I-type instructions.
 	ITypeImmMask = 0xfff00000
+
+	// JTypeImmMask is a mask including only the immediate portion of
+	// J-type instructions.
+	JTypeImmMask = 0xfffff000
 
 	// STypeImmMask is a mask including only the immediate portion of
 	// S-type instructions.

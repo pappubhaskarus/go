@@ -6,15 +6,26 @@ package runtime_test
 
 import (
 	"flag"
+	"fmt"
+	"internal/cpu"
+	"internal/runtime/atomic"
 	"io"
 	. "runtime"
 	"runtime/debug"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 	"unsafe"
 )
 
-var flagQuick = flag.Bool("quick", false, "skip slow tests, for second run in all.bash")
+// flagQuick is set by the -quick option to skip some relatively slow tests.
+// This is used by the cmd/dist test runtime:cpu124.
+// The cmd/dist test passes both -test.short and -quick;
+// there are tests that only check testing.Short, and those tests will
+// not be skipped if only -quick is used.
+var flagQuick = flag.Bool("quick", false, "skip slow tests, for cmd/dist test runtime:cpu124")
 
 func init() {
 	// We're testing the runtime, so make tracebacks show things
@@ -195,10 +206,11 @@ func TestSetPanicOnFault(t *testing.T) {
 // testSetPanicOnFault tests one potentially faulting address.
 // It deliberately constructs and uses an invalid pointer,
 // so mark it as nocheckptr.
+//
 //go:nocheckptr
 func testSetPanicOnFault(t *testing.T, addr uintptr, nfault *int) {
-	if GOOS == "js" {
-		t.Skip("js does not support catching faults")
+	if GOOS == "js" || GOOS == "wasip1" {
+		t.Skip(GOOS + " does not support catching faults")
 	}
 
 	defer func() {
@@ -355,10 +367,349 @@ func TestGoroutineProfileTrivial(t *testing.T) {
 	}
 }
 
+func BenchmarkGoroutineProfile(b *testing.B) {
+	run := func(fn func() bool) func(b *testing.B) {
+		runOne := func(b *testing.B) {
+			latencies := make([]time.Duration, 0, b.N)
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				start := time.Now()
+				ok := fn()
+				if !ok {
+					b.Fatal("goroutine profile failed")
+				}
+				latencies = append(latencies, time.Since(start))
+			}
+			b.StopTimer()
+
+			// Sort latencies then report percentiles.
+			slices.Sort(latencies)
+			b.ReportMetric(float64(latencies[len(latencies)*50/100]), "p50-ns")
+			b.ReportMetric(float64(latencies[len(latencies)*90/100]), "p90-ns")
+			b.ReportMetric(float64(latencies[len(latencies)*99/100]), "p99-ns")
+		}
+		return func(b *testing.B) {
+			b.Run("idle", runOne)
+
+			b.Run("loaded", func(b *testing.B) {
+				stop := applyGCLoad(b)
+				runOne(b)
+				// Make sure to stop the timer before we wait! The load created above
+				// is very heavy-weight and not easy to stop, so we could end up
+				// confusing the benchmarking framework for small b.N.
+				b.StopTimer()
+				stop()
+			})
+		}
+	}
+
+	// Measure the cost of counting goroutines
+	b.Run("small-nil", run(func() bool {
+		GoroutineProfile(nil)
+		return true
+	}))
+
+	// Measure the cost with a small set of goroutines
+	n := NumGoroutine()
+	p := make([]StackRecord, 2*n+2*GOMAXPROCS(0))
+	b.Run("small", run(func() bool {
+		_, ok := GoroutineProfile(p)
+		return ok
+	}))
+
+	// Measure the cost with a large set of goroutines
+	ch := make(chan int)
+	var ready, done sync.WaitGroup
+	for i := 0; i < 5000; i++ {
+		ready.Add(1)
+		done.Add(1)
+		go func() { ready.Done(); <-ch; done.Done() }()
+	}
+	ready.Wait()
+
+	// Count goroutines with a large allgs list
+	b.Run("large-nil", run(func() bool {
+		GoroutineProfile(nil)
+		return true
+	}))
+
+	n = NumGoroutine()
+	p = make([]StackRecord, 2*n+2*GOMAXPROCS(0))
+	b.Run("large", run(func() bool {
+		_, ok := GoroutineProfile(p)
+		return ok
+	}))
+
+	close(ch)
+	done.Wait()
+
+	// Count goroutines with a large (but unused) allgs list
+	b.Run("sparse-nil", run(func() bool {
+		GoroutineProfile(nil)
+		return true
+	}))
+
+	// Measure the cost of a large (but unused) allgs list
+	n = NumGoroutine()
+	p = make([]StackRecord, 2*n+2*GOMAXPROCS(0))
+	b.Run("sparse", run(func() bool {
+		_, ok := GoroutineProfile(p)
+		return ok
+	}))
+}
+
 func TestVersion(t *testing.T) {
 	// Test that version does not contain \r or \n.
 	vers := Version()
 	if strings.Contains(vers, "\r") || strings.Contains(vers, "\n") {
 		t.Fatalf("cr/nl in version: %q", vers)
 	}
+}
+
+func TestTimediv(t *testing.T) {
+	for _, tc := range []struct {
+		num int64
+		div int32
+		ret int32
+		rem int32
+	}{
+		{
+			num: 8,
+			div: 2,
+			ret: 4,
+			rem: 0,
+		},
+		{
+			num: 9,
+			div: 2,
+			ret: 4,
+			rem: 1,
+		},
+		{
+			// Used by runtime.check.
+			num: 12345*1000000000 + 54321,
+			div: 1000000000,
+			ret: 12345,
+			rem: 54321,
+		},
+		{
+			num: 1<<32 - 1,
+			div: 2,
+			ret: 1<<31 - 1, // no overflow.
+			rem: 1,
+		},
+		{
+			num: 1 << 32,
+			div: 2,
+			ret: 1<<31 - 1, // overflow.
+			rem: 0,
+		},
+		{
+			num: 1 << 40,
+			div: 2,
+			ret: 1<<31 - 1, // overflow.
+			rem: 0,
+		},
+		{
+			num: 1<<40 + 1,
+			div: 1 << 10,
+			ret: 1 << 30,
+			rem: 1,
+		},
+	} {
+		name := fmt.Sprintf("%d div %d", tc.num, tc.div)
+		t.Run(name, func(t *testing.T) {
+			// Double check that the inputs make sense using
+			// standard 64-bit division.
+			ret64 := tc.num / int64(tc.div)
+			rem64 := tc.num % int64(tc.div)
+			if ret64 != int64(int32(ret64)) {
+				// Simulate timediv overflow value.
+				ret64 = 1<<31 - 1
+				rem64 = 0
+			}
+			if ret64 != int64(tc.ret) {
+				t.Errorf("%d / %d got ret %d rem %d want ret %d rem %d", tc.num, tc.div, ret64, rem64, tc.ret, tc.rem)
+			}
+
+			var rem int32
+			ret := Timediv(tc.num, tc.div, &rem)
+			if ret != tc.ret || rem != tc.rem {
+				t.Errorf("timediv %d / %d got ret %d rem %d want ret %d rem %d", tc.num, tc.div, ret, rem, tc.ret, tc.rem)
+			}
+		})
+	}
+}
+
+func BenchmarkProcYield(b *testing.B) {
+	benchN := func(n uint32) func(*testing.B) {
+		return func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				ProcYield(n)
+			}
+		}
+	}
+
+	b.Run("1", benchN(1))
+	b.Run("10", benchN(10))
+	b.Run("30", benchN(30)) // active_spin_cnt in lock_sema.go and lock_futex.go
+	b.Run("100", benchN(100))
+	b.Run("1000", benchN(1000))
+}
+
+func BenchmarkOSYield(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		OSYield()
+	}
+}
+
+func BenchmarkMutexContention(b *testing.B) {
+	// Measure throughput of a single mutex with all threads contending
+	//
+	// Share a single counter across all threads. Progress from any thread is
+	// progress for the benchmark as a whole. We don't measure or give points
+	// for fairness here, arbitrary delay to any given thread's progress is
+	// invisible and allowed.
+	//
+	// The cache line that holds the count value will need to move between
+	// processors, but not as often as the cache line that holds the mutex. The
+	// mutex protects access to the count value, which limits contention on that
+	// cache line. This is a simple design, but it helps to make the behavior of
+	// the benchmark clear. Most real uses of mutex will protect some number of
+	// cache lines anyway.
+
+	var state struct {
+		_     cpu.CacheLinePad
+		lock  Mutex
+		_     cpu.CacheLinePad
+		count atomic.Int64
+		_     cpu.CacheLinePad
+	}
+
+	procs := GOMAXPROCS(0)
+	var wg sync.WaitGroup
+	for range procs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				Lock(&state.lock)
+				ours := state.count.Add(1)
+				Unlock(&state.lock)
+				if ours >= int64(b.N) {
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func BenchmarkMutexHandoff(b *testing.B) {
+	testcase := func(delay func(l *Mutex)) func(b *testing.B) {
+		return func(b *testing.B) {
+			if workers := 2; GOMAXPROCS(0) < workers {
+				b.Skipf("requires GOMAXPROCS >= %d", workers)
+			}
+
+			// Measure latency of mutex handoff between threads.
+			//
+			// Hand off a runtime.mutex between two threads, one running a
+			// "coordinator" goroutine and the other running a "worker"
+			// goroutine. We don't override the runtime's typical
+			// goroutine/thread mapping behavior.
+			//
+			// Measure the latency, starting when the coordinator enters a call
+			// to runtime.unlock and ending when the worker's call to
+			// runtime.lock returns. The benchmark can specify a "delay"
+			// function to simulate the length of the mutex-holder's critical
+			// section, including to arrange for the worker's thread to be in
+			// either the "spinning" or "sleeping" portions of the runtime.lock2
+			// implementation. Measurement starts after any such "delay".
+			//
+			// The two threads' goroutines communicate their current position to
+			// each other in a non-blocking way via the "turn" state.
+
+			var state struct {
+				_    cpu.CacheLinePad
+				lock Mutex
+				_    cpu.CacheLinePad
+				turn atomic.Int64
+				_    cpu.CacheLinePad
+			}
+
+			var delta atomic.Int64
+			var wg sync.WaitGroup
+
+			// coordinator:
+			//  - acquire the mutex
+			//  - set the turn to 2 mod 4, instructing the worker to begin its Lock call
+			//  - wait until the mutex is contended
+			//  - wait a bit more so the worker can commit to its sleep
+			//  - release the mutex and wait for it to be our turn (0 mod 4) again
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var t int64
+				for range b.N {
+					Lock(&state.lock)
+					state.turn.Add(2)
+					delay(&state.lock)
+					t -= Nanotime() // start the timer
+					Unlock(&state.lock)
+					for state.turn.Load()&0x2 != 0 {
+					}
+				}
+				state.turn.Add(1)
+				delta.Add(t)
+			}()
+
+			// worker:
+			//  - wait until its our turn (2 mod 4)
+			//  - acquire and release the mutex
+			//  - switch the turn counter back to the coordinator (0 mod 4)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var t int64
+				for {
+					switch state.turn.Load() & 0x3 {
+					case 0:
+					case 1, 3:
+						delta.Add(t)
+						return
+					case 2:
+						Lock(&state.lock)
+						t += Nanotime() // stop the timer
+						Unlock(&state.lock)
+						state.turn.Add(2)
+					}
+				}
+			}()
+
+			wg.Wait()
+			b.ReportMetric(float64(delta.Load())/float64(b.N), "ns/op")
+		}
+	}
+
+	b.Run("Solo", func(b *testing.B) {
+		var lock Mutex
+		for range b.N {
+			Lock(&lock)
+			Unlock(&lock)
+		}
+	})
+
+	b.Run("FastPingPong", testcase(func(l *Mutex) {}))
+	b.Run("SlowPingPong", testcase(func(l *Mutex) {
+		// Wait for the worker to stop spinning and prepare to sleep
+		for !MutexContended(l) {
+		}
+		// Wait a bit longer so the OS can finish committing the worker to its
+		// sleep. Balance consistency against getting enough iterations.
+		const extraNs = 10e3
+		for t0 := Nanotime(); Nanotime()-t0 < extraNs; {
+		}
+	}))
 }

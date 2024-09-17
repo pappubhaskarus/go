@@ -30,10 +30,10 @@ import (
 //		(*&byref)++
 //	}(byval, &byref, 42)
 func directClosureCall(n *ir.CallExpr) {
-	clo := n.X.(*ir.ClosureExpr)
+	clo := n.Fun.(*ir.ClosureExpr)
 	clofn := clo.Func
 
-	if ir.IsTrivialClosure(clo) {
+	if !clofn.IsClosure() {
 		return // leave for walkClosure to handle
 	}
 
@@ -47,9 +47,8 @@ func directClosureCall(n *ir.CallExpr) {
 			// and v remains PAUTOHEAP with &v heapaddr
 			// (accesses will implicitly deref &v).
 
-			addr := ir.NewNameAt(clofn.Pos(), typecheck.Lookup("&"+v.Sym().Name))
+			addr := ir.NewNameAt(clofn.Pos(), typecheck.Lookup("&"+v.Sym().Name), types.NewPtr(v.Type()))
 			addr.Curfn = clofn
-			addr.SetType(types.NewPtr(v.Type()))
 			v.Heapaddr = addr
 			v = addr
 		}
@@ -68,12 +67,12 @@ func directClosureCall(n *ir.CallExpr) {
 
 	// Create new function type with parameters prepended, and
 	// then update type and declarations.
-	typ = types.NewSignature(typ.Pkg(), nil, nil, append(params, typ.Params().FieldSlice()...), typ.Results().FieldSlice())
+	typ = types.NewSignature(nil, append(params, typ.Params()...), typ.Results())
 	f.SetType(typ)
 	clofn.Dcl = append(decls, clofn.Dcl...)
 
 	// Rewrite call.
-	n.X = f
+	n.Fun = f
 	n.Args.Prepend(closureArgs(clo)...)
 
 	// Update the call expression's type. We need to do this
@@ -81,23 +80,22 @@ func directClosureCall(n *ir.CallExpr) {
 	// node, but we only rewrote the ONAME node's type. Logically,
 	// they're the same, but the stack offsets probably changed.
 	if typ.NumResults() == 1 {
-		n.SetType(typ.Results().Field(0).Type)
+		n.SetType(typ.Result(0).Type)
 	} else {
-		n.SetType(typ.Results())
+		n.SetType(typ.ResultsTuple())
 	}
 
 	// Add to Closures for enqueueFunc. It's no longer a proper
 	// closure, but we may have already skipped over it in the
-	// functions list as a non-trivial closure, so this just
-	// ensures it's compiled.
+	// functions list, so this just ensures it's compiled.
 	ir.CurFunc.Closures = append(ir.CurFunc.Closures, clofn)
 }
 
 func walkClosure(clo *ir.ClosureExpr, init *ir.Nodes) ir.Node {
 	clofn := clo.Func
 
-	// If no closure vars, don't bother wrapping.
-	if ir.IsTrivialClosure(clo) {
+	// If not a closure, don't bother wrapping.
+	if !clofn.IsClosure() {
 		if base.Debug.Closure > 0 {
 			base.WarnfAt(clo.Pos(), "closure converted to global")
 		}
@@ -120,7 +118,7 @@ func walkClosure(clo *ir.ClosureExpr, init *ir.Nodes) ir.Node {
 
 	typ := typecheck.ClosureType(clo)
 
-	clos := ir.NewCompLitExpr(base.Pos, ir.OCOMPLIT, ir.TypeNode(typ), nil)
+	clos := ir.NewCompLitExpr(base.Pos, ir.OCOMPLIT, typ, nil)
 	clos.SetEsc(clo.Esc())
 	clos.List = append([]ir.Node{ir.NewUnaryExpr(base.Pos, ir.OCFUNC, clofn.Nname)}, closureArgs(clo)...)
 	for i, value := range clos.List {
@@ -145,7 +143,7 @@ func walkClosure(clo *ir.ClosureExpr, init *ir.Nodes) ir.Node {
 	return walkExpr(cfn, init)
 }
 
-// closureArgs returns a slice of expressions that an be used to
+// closureArgs returns a slice of expressions that can be used to
 // initialize the given closure's free variables. These correspond
 // one-to-one with the variables in clo.Func.ClosureVars, and will be
 // either an ONAME node (if the variable is captured by value) or an
@@ -186,7 +184,7 @@ func walkMethodValue(n *ir.SelectorExpr, init *ir.Nodes) ir.Node {
 
 	typ := typecheck.MethodValueType(n)
 
-	clos := ir.NewCompLitExpr(base.Pos, ir.OCOMPLIT, ir.TypeNode(typ), nil)
+	clos := ir.NewCompLitExpr(base.Pos, ir.OCOMPLIT, typ, nil)
 	clos.SetEsc(n.Esc())
 	clos.List = []ir.Node{ir.NewUnaryExpr(base.Pos, ir.OCFUNC, methodValueWrapper(n)), n.X}
 
@@ -217,7 +215,6 @@ func methodValueWrapper(dot *ir.SelectorExpr) *ir.Name {
 		base.Fatalf("methodValueWrapper: unexpected %v (%v)", dot, dot.Op())
 	}
 
-	t0 := dot.Type()
 	meth := dot.Sel
 	rcvrtype := dot.X.Type()
 	sym := ir.MethodSymSuffix(rcvrtype, meth, "-fm")
@@ -227,58 +224,6 @@ func methodValueWrapper(dot *ir.SelectorExpr) *ir.Name {
 	}
 	sym.SetUniq(true)
 
-	if base.Debug.Unified != 0 && base.Debug.UnifiedQuirks == 0 {
-		base.FatalfAt(dot.Pos(), "missing wrapper for %v", meth)
-	}
-
-	savecurfn := ir.CurFunc
-	saveLineNo := base.Pos
-	ir.CurFunc = nil
-
-	// Set line number equal to the line number where the method is declared.
-	if pos := dot.Selection.Pos; pos.IsKnown() {
-		base.Pos = pos
-	}
-	// Note: !dot.Selection.Pos.IsKnown() happens for method expressions where
-	// the method is implicitly declared. The Error method of the
-	// built-in error type is one such method.  We leave the line
-	// number at the use of the method expression in this
-	// case. See issue 29389.
-
-	tfn := ir.NewFuncType(base.Pos, nil,
-		typecheck.NewFuncParams(t0.Params(), true),
-		typecheck.NewFuncParams(t0.Results(), false))
-
-	fn := typecheck.DeclFunc(sym, tfn)
-	fn.SetDupok(true)
-	fn.SetWrapper(true)
-
-	// Declare and initialize variable holding receiver.
-	ptr := ir.NewHiddenParam(base.Pos, fn, typecheck.Lookup(".this"), rcvrtype)
-
-	call := ir.NewCallExpr(base.Pos, ir.OCALL, ir.NewSelectorExpr(base.Pos, ir.OXDOT, ptr, meth), nil)
-	call.Args = ir.ParamNames(tfn.Type())
-	call.IsDDD = tfn.Type().IsVariadic()
-
-	var body ir.Node = call
-	if t0.NumResults() != 0 {
-		ret := ir.NewReturnStmt(base.Pos, nil)
-		ret.Results = []ir.Node{call}
-		body = ret
-	}
-
-	fn.Body = []ir.Node{body}
-	typecheck.FinishFuncBody()
-
-	typecheck.Func(fn)
-	// Need to typecheck the body of the just-generated wrapper.
-	// typecheckslice() requires that Curfn is set when processing an ORETURN.
-	ir.CurFunc = fn
-	typecheck.Stmts(fn.Body)
-	sym.Def = fn.Nname
-	typecheck.Target.Decls = append(typecheck.Target.Decls, fn)
-	ir.CurFunc = savecurfn
-	base.Pos = saveLineNo
-
-	return fn.Nname
+	base.FatalfAt(dot.Pos(), "missing wrapper for %v", meth)
+	panic("unreachable")
 }
